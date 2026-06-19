@@ -89,6 +89,10 @@ class TestTessellation(unittest.TestCase):
         p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
         n = G.fit_count(10.0, p, margin=p / 2)
         self.assertGreaterEqual(n, 1)
+    def test_fit_slot_len_raises_when_infeasible(self):
+        # tab=10.0 cm is absurdly large; no slot_len can yield a feasible pitch
+        with self.assertRaises(ValueError):
+            G.fit_slot_len(10.0, 3, self.GAP, 10.0, self.FIL, 40.0, margin=0.0)
 
 if __name__ == "__main__":
     unittest.main()

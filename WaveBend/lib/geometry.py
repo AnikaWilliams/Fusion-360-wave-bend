@@ -161,7 +161,11 @@ def fit_count(bend_len, pitch, margin):
 
 
 def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
-    """Invert fit_count: pick the slot_len whose solved pitch yields ~count cells."""
+    """Invert fit_count: pick the slot_len whose solved pitch yields ~count cells.
+
+    Returns a slot_len such that solve_pitch(result) yields a feasible pitch, or raises
+    ValueError if no feasible pitch exists in the search range (e.g., tab too large).
+    """
     usable = max(bend_len - 2.0 * margin, 1e-6)
     target_pitch = usable / max(count, 1)
     # binary search slot_len so solve_pitch(slot_len) ~= target_pitch (pitch grows with slot_len)
@@ -176,10 +180,33 @@ def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
             lo = mid
         else:
             hi = mid
-    return (lo + hi) / 2.0
+    result = (lo + hi) / 2.0
+    # Guard: verify result actually yields a feasible pitch
+    try:
+        solve_pitch(result, gap, tab, fillet_r, end_angle_deg)
+    except ValueError:
+        raise ValueError(
+            f"cannot fit {count} slots: tab too large for this bend length / gap / fillet")
+    return result
 
 
 def generate_pattern(bend_len, gap, tab, slot_len, fillet_r, end_angle_deg=40.0):
+    """Tessellate cells along a bend in two brick-staggered rows.
+
+    Args: bend_len (float) - total bend length to tessellate
+          gap, tab, slot_len, fillet_r, end_angle_deg - cell geometry params
+
+    Returns dict with keys:
+      - profiles: list of build_cell profiles (filleted polygons)
+      - count: cells in the UPPER row (representative 'cells per row'; lower row may
+               differ by ±1 due to brick offset)
+      - pitch: solved pitch (x-spacing between cells within a row)
+      - row_offset: y-distance from bend center to each row
+      - central_tab: clearance between rows == tab (by construction)
+      - min_ligament: narrowest gap between any two placed cells
+
+    Note: len(result["profiles"]) is TOTAL cells placed; count is upper-row count.
+    """
     th = end_angle_deg
     d = _row_offset(gap, tab)
     pitch = solve_pitch(slot_len, gap, tab, fillet_r, th)
