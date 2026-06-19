@@ -114,3 +114,91 @@ def build_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, cx=0.0, cy=0.0):
         Pt(cx - slot_len / 2.0, cy),  # left point
     ]
     return filleted_polygon(verts, fillet_r)
+
+
+# ---------------------------------------------------------------------------
+# Tessellation helpers
+# ---------------------------------------------------------------------------
+
+def _row_offset(gap, tab):
+    """v-distance of each row center from the bend line so the central tab == tab."""
+    return (tab + gap) / 2.0
+
+
+def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th):
+    """Build a small 2-row x 3-col patch at this pitch and measure the tightest gap."""
+    d = _row_offset(gap, tab)
+    cells = []
+    for v, off in ((+d, 0.0), (-d, pitch / 2.0)):
+        for i in range(3):
+            cells.append(build_cell(slot_len, gap, fillet_r, th, off + i * pitch, v))
+    return min_profile_distance(cells)
+
+
+def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48):
+    th = end_angle_deg
+    ext = (gap / 2.0) / math.tan(math.radians(th))
+    lo = 2.0 * ext + 0.05 * slot_len     # below this, pointed ends collide
+    hi = 1.6 * slot_len
+    step = (hi - lo) / samples
+    feasible = []
+    p = lo
+    while p <= hi + 1e-12:
+        if _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th) >= tab - 1e-6:
+            feasible.append(p)
+        p += step
+    if not feasible:
+        raise ValueError(
+            "no feasible pitch: tab is too large for this slot length / gap / fillet")
+    return min(feasible)                  # smallest feasible pitch = densest pattern
+
+
+def fit_count(bend_len, pitch, margin):
+    usable = bend_len - 2.0 * margin
+    if usable <= 0:
+        return 0
+    return max(1, int(usable // pitch) + 1)
+
+
+def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
+    """Invert fit_count: pick the slot_len whose solved pitch yields ~count cells."""
+    usable = max(bend_len - 2.0 * margin, 1e-6)
+    target_pitch = usable / max(count, 1)
+    # binary search slot_len so solve_pitch(slot_len) ~= target_pitch (pitch grows with slot_len)
+    lo, hi = 4.0 * fillet_r + 1e-3, 4.0 * bend_len
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        try:
+            p = solve_pitch(mid, gap, tab, fillet_r, end_angle_deg)
+        except ValueError:
+            lo = mid; continue
+        if p < target_pitch:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def generate_pattern(bend_len, gap, tab, slot_len, fillet_r, end_angle_deg=40.0):
+    th = end_angle_deg
+    d = _row_offset(gap, tab)
+    pitch = solve_pitch(slot_len, gap, tab, fillet_r, th)
+    margin = pitch / 2.0                              # solid end margins, half a pitch
+    count = fit_count(bend_len, pitch, margin)
+    span = (count - 1) * pitch
+    start = (bend_len - span) / 2.0                   # center the band
+    profiles = []
+    for v, row_off in ((+d, 0.0), (-d, pitch / 2.0)):
+        u = start + row_off
+        while u <= bend_len - margin + 1e-9:
+            if u >= margin - 1e-9:
+                profiles.append(build_cell(slot_len, gap, fillet_r, th, u, v))
+            u += pitch
+    return {
+        "profiles": profiles,
+        "count": count,
+        "pitch": pitch,
+        "row_offset": d,
+        "central_tab": 2.0 * d - gap,                 # == tab by construction
+        "min_ligament": min_profile_distance(profiles) if len(profiles) > 1 else float("inf"),
+    }

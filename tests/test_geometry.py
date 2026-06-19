@@ -61,5 +61,34 @@ class TestCell(unittest.TestCase):
         with self.assertRaises(ValueError):
             G.build_cell(0.2, 0.19, 0.2, 40.0)            # fillet bigger than the flat
 
+class TestTessellation(unittest.TestCase):
+    # representative cm inputs: t=0.3175 (0.125"), gap=0.7t, tab=t, fillet=gap/2
+    T = 0.3175
+    GAP = 0.3175 * 0.7
+    TAB = 0.3175
+    FIL = (0.3175 * 0.7) / 2
+    def test_solve_pitch_feasible(self):
+        p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
+        self.assertGreater(p, 0.0)
+    def test_solve_pitch_raises_when_tab_too_large(self):
+        with self.assertRaises(ValueError):
+            G.solve_pitch(1.651, self.GAP, 5.0, self.FIL, 40.0)   # absurd tab
+    def test_pattern_honors_no_ligament_below_tab(self):
+        out = G.generate_pattern(10.0, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
+        self.assertGreaterEqual(out["min_ligament"], self.TAB - 1e-3)
+        self.assertAlmostEqual(out["central_tab"], self.TAB, places=4)
+        self.assertGreater(out["count"], 1)
+    def test_pattern_within_bend_length(self):
+        B = 8.0
+        out = G.generate_pattern(B, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
+        for prof in out["profiles"]:
+            for p in G.sample_profile(prof):
+                self.assertGreaterEqual(p.x, -1e-6)
+                self.assertLessEqual(p.x, B + 1e-6)
+    def test_fit_count_and_fit_slot_len_roundtrip(self):
+        p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
+        n = G.fit_count(10.0, p, margin=p / 2)
+        self.assertGreaterEqual(n, 1)
+
 if __name__ == "__main__":
     unittest.main()
