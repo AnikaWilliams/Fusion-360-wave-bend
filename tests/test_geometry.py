@@ -43,5 +43,23 @@ class TestFillet(unittest.TestCase):
         self.assertAlmostEqual(pts[0].x, pts[-1].x, places=6)
         self.assertAlmostEqual(pts[0].y, pts[-1].y, places=6)
 
+class TestCell(unittest.TestCase):
+    def test_cell_height_equals_gap_and_width_under_slotlen(self):
+        cell = G.build_cell(1.651, 0.1905, 0.05, 40.0)   # cm: 0.65in, 0.075in, ~0.02in
+        pts = G.sample_profile(cell)
+        xmin, ymin, xmax, ymax = G._bbox(pts)
+        self.assertAlmostEqual(ymax - ymin, 0.1905, places=3)        # height == gap
+        self.assertLessEqual(xmax - xmin, 1.651 + 1e-6)              # width <= slot_len
+        self.assertGreater(xmax - xmin, 1.651 - 4 * 0.05)           # not collapsed
+    def test_cell_centered(self):
+        cell = G.build_cell(1.651, 0.1905, 0.05, 40.0, cx=3.0, cy=-2.0)
+        pts = G.sample_profile(cell)
+        xmin, ymin, xmax, ymax = G._bbox(pts)
+        self.assertAlmostEqual((xmin + xmax) / 2, 3.0, places=3)
+        self.assertAlmostEqual((ymin + ymax) / 2, -2.0, places=3)
+    def test_cell_raises_when_too_short(self):
+        with self.assertRaises(ValueError):
+            G.build_cell(0.2, 0.19, 0.2, 40.0)            # fillet bigger than the flat
+
 if __name__ == "__main__":
     unittest.main()

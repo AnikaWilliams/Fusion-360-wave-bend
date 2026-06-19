@@ -95,3 +95,22 @@ def filleted_polygon(verts, R):
         next_T1 = f[(i + 1) % n][0]
         segs.append(("line", T2, next_T1))
     return segs
+
+def build_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, cx=0.0, cy=0.0):
+    """Filleted angled-end hexagon cell centered at (cx, cy), long axis along x."""
+    th = math.radians(end_angle_deg)
+    ext = (gap / 2.0) / math.tan(th)          # how far each pointed end extends past the flats
+    a = slot_len / 2.0 - ext                   # half-length of the flat top/bottom edges
+    if a <= fillet_r * 1.05:
+        raise ValueError(
+            f"slot_len={slot_len:.4f} too short for fillet_r={fillet_r:.4f} at {end_angle_deg} deg")
+    h = gap / 2.0
+    verts = [
+        Pt(cx - a, cy + h),        # top-left
+        Pt(cx + a, cy + h),        # top-right
+        Pt(cx + slot_len / 2.0, cy),  # right point
+        Pt(cx + a, cy - h),        # bottom-right
+        Pt(cx - a, cy - h),        # bottom-left
+        Pt(cx - slot_len / 2.0, cy),  # left point
+    ]
+    return filleted_polygon(verts, fillet_r)
