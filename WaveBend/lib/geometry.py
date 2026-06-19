@@ -64,3 +64,34 @@ def min_profile_distance(profiles, n=12):
                     if d < best:
                         best = d
     return best
+
+def fillet_corner(A, B, C, R):
+    """Tangent fillet of radius R at vertex B (edges B->A and B->C). Convex corners."""
+    v1 = v_unit(v_sub(A, B)); v2 = v_unit(v_sub(C, B))
+    cosang = max(-1.0, min(1.0, v1.x * v2.x + v1.y * v2.y))
+    phi = math.acos(cosang)                      # interior angle at B
+    tan_len = R / math.tan(phi / 2.0)
+    T1 = v_add(B, v_mul(v1, tan_len))            # tangent point on edge toward A
+    T2 = v_add(B, v_mul(v2, tan_len))            # tangent point on edge toward C
+    bis = v_unit(v_add(v1, v2))                  # bisector, points into the corner
+    center = v_add(B, v_mul(bis, R / math.sin(phi / 2.0)))
+    a0 = math.atan2(T1.y - center.y, T1.x - center.x)
+    a1 = math.atan2(T2.y - center.y, T2.x - center.x)
+    da = a1 - a0                                 # take the short sweep
+    while da <= -math.pi: da += 2 * math.pi
+    while da > math.pi:  da -= 2 * math.pi
+    return T1, T2, center, a0, a0 + da, tan_len
+
+def filleted_polygon(verts, R):
+    """Closed profile: for each vertex emit its arc (T1->T2) then a line to the
+    next vertex's entry tangent point. Returns [arc, line, arc, line, ...]."""
+    n = len(verts)
+    f = [fillet_corner(verts[(i - 1) % n], verts[i], verts[(i + 1) % n], R)
+         for i in range(n)]
+    segs = []
+    for i in range(n):
+        T1, T2, c, a0, a1, _ = f[i]
+        segs.append(("arc", c, R, a0, a1, T1, T2))
+        next_T1 = f[(i + 1) % n][0]
+        segs.append(("line", T2, next_T1))
+    return segs

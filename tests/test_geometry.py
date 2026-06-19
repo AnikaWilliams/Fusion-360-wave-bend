@@ -23,5 +23,25 @@ class TestPrimitives(unittest.TestCase):
             return [("line", c[i], c[(i+1) % 4]) for i in range(4)]
         self.assertAlmostEqual(G.min_profile_distance([sq(0), sq(2.0)], n=8), 1.0, places=3)
 
+class TestFillet(unittest.TestCase):
+    def _dist_pt_to_line(self, p, a, d):       # perpendicular dist, d unit dir
+        ap = G.v_sub(p, a)
+        return abs(ap.x * d.y - ap.y * d.x)
+    def test_fillet_is_tangent_to_both_edges(self):
+        A = G.Pt(-1, 0); B = G.Pt(0, 0); C = G.Pt(0, 1)   # right-angle corner
+        T1, T2, c, a0, a1, t = G.fillet_corner(A, B, C, 0.1)
+        d1 = self._dist_pt_to_line(c, B, G.v_unit(G.v_sub(A, B)))
+        d2 = self._dist_pt_to_line(c, B, G.v_unit(G.v_sub(C, B)))
+        self.assertAlmostEqual(d1, 0.1, places=6)
+        self.assertAlmostEqual(d2, 0.1, places=6)
+    def test_filleted_square_is_closed(self):
+        verts = [G.Pt(-1, -1), G.Pt(1, -1), G.Pt(1, 1), G.Pt(-1, 1)]
+        segs = G.filleted_polygon(verts, 0.2)
+        self.assertEqual(len(segs), 8)                    # 4 arcs + 4 lines
+        pts = G.sample_profile(segs, n=6)
+        # closed: last sampled point coincides with first
+        self.assertAlmostEqual(pts[0].x, pts[-1].x, places=6)
+        self.assertAlmostEqual(pts[0].y, pts[-1].y, places=6)
+
 if __name__ == "__main__":
     unittest.main()
