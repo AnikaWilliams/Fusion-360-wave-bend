@@ -691,6 +691,17 @@ sys.path.insert(0, os.path.join(HERE, "WaveBend", "lib"))
 import geometry as G
 import fusion_build as FB
 
+LOG_PATH = os.path.join(HERE, "last_run.log")            # the implementer reads THIS file
+
+def _log(msg):
+    """Write a clean, machine-readable run record the implementer can Read directly."""
+    try:
+        with open(LOG_PATH, "w", encoding="utf-8") as fh:
+            fh.write(msg)
+    except Exception:
+        pass
+    print(msg)                                           # also -> Text Commands palette
+
 # ---- HARD-CODED Stage 1a inputs (cm). 0.125 in plate, 0.7 gap, etc. ----
 THICKNESS_CM = 0.3175
 GAP_CM       = THICKNESS_CM * 0.7
@@ -709,29 +720,33 @@ def run(context):
         frame = FB.local_frame(sel.entity)
         pattern = G.generate_pattern(frame[3], GAP_CM, TAB_CM, SLOT_LEN_CM, FILLET_CM, 40.0)
         FB.draw_and_cut(comp, pattern, frame, THICKNESS_CM)
-        ui.messageBox(f"Wave bend: {pattern['count']} cells/row, "
-                      f"pitch {pattern['pitch']:.3f} cm, min ligament "
-                      f"{pattern['min_ligament']:.3f} cm")
+        _log("OK  Wave bend: {} cells/row, pitch {:.3f} cm, min ligament {:.3f} cm".format(
+             pattern['count'], pattern['pitch'], pattern['min_ligament']))
+        ui.messageBox("Wave bend done. See last_run.log")
     except Exception:
-        msg = "Wave-bend script failed:\n" + traceback.format_exc()
-        print(msg)                                       # -> Text Commands palette
-        if ui: ui.messageBox(msg)
+        _log("FAIL Wave-bend script:\n" + traceback.format_exc())
+        if ui: ui.messageBox("Wave-bend script failed. See last_run.log")
 ```
+
+> **Tightened test loop:** the script writes `last_run.log` (success summary *or* full
+> traceback). After the user clicks **Run**, the implementer reads that file directly —
+> no retyping, no screenshots. Tasks 7, 9, and 10 reuse the same `_log()` mechanism so
+> every Fusion run ends with one readable file. `last_run.log` is gitignored.
 
 - [ ] **Step 2: User runs it in Fusion (verification protocol)**
 
 Provide the user these steps:
 1. New design → create a flat rectangular plate (e.g. 100 × 60 × 3.175 mm).
 2. `Utilities ▸ ADD-INS ▸ Scripts and Add-Ins ▸` add the repo folder, select `wave_bend_script`, **Run**.
-3. Open `Utilities ▸ ADD-INS ▸ Text Commands` first so any traceback is visible.
-4. When prompted, click a **top-face edge** to act as the bend line.
+3. When prompted, click a **top-face edge** to act as the bend line.
+4. Tell the implementer "done" — **the implementer reads `last_run.log` directly** (no copy-paste needed).
 
-Expected: a staggered wave pattern is cut through the plate; the message box reports a cell count and `min ligament ≥ tab` (≥ 0.3175 cm). No traceback in Text Commands.
-If it fails: copy the full Text Commands traceback back to the implementer.
+Expected `last_run.log`: a line starting `OK  Wave bend: N cells/row … min ligament … cm`, and a staggered wave pattern cut through the plate.
+On failure the log starts `FAIL` followed by the full traceback — the implementer reads and fixes from it.
 
-- [ ] **Step 3: Fix forward from the pasted error**
+- [ ] **Step 3: Fix forward from `last_run.log`**
 
-Common failure → fix map (apply the one that matches the pasted traceback):
+Common failure → fix map (apply the one that matches the logged traceback):
 - `Point3D.create` arg error → confirm signature `createByReal` vs `create` *(docs)*.
 - `entity has no attribute 'faces'` → the picked entity was a `SketchLine`; derive the plane from the sketch's reference plane instead *(docs)*.
 - cut "no target body" / empty profiles → a loop wasn't closed; verify `sk.profiles.count` equals the cell count before extruding.
