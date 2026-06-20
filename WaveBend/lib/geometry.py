@@ -150,13 +150,20 @@ def _row_offset(gap, tab):
 
 
 def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th):
-    """Build a small 2-row x 3-col patch at this pitch and measure the tightest gap."""
+    """Build a small 2-row x 3-col patch at this pitch and measure the tightest gap.
+
+    Uses coarse sampling (n=6): the BINDING ligaments here are between parallel straight
+    edges (the diagonal gaps and the central tab), whose point-to-segment distance is
+    exact at any sampling density, so the feasibility decision is unaffected -- only the
+    far, non-binding vertex-to-edge approaches lose precision. This keeps solve_pitch's
+    repeated scans cheap. generate_pattern still reports min_ligament at full density.
+    """
     d = _row_offset(gap, tab)
     cells = []
     for v, off in ((+d, 0.0), (-d, pitch / 2.0)):
         for i in range(3):
             cells.append(build_cell(slot_len, gap, fillet_r, th, off + i * pitch, v))
-    return min_profile_distance(cells)
+    return min_profile_distance(cells, n=6)
 
 
 def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48):
