@@ -97,17 +97,17 @@ def draw_and_cut(comp, pattern, frame, depth_cm):
 # ---- Task 7: read thickness + material from the body --------------------------
 
 def measure_thickness_cm(face):
-    """Thickness = body bounding-box extent along the face normal (cm)."""
+    """Sheet thickness (cm) = body volume / selected-face area.
+
+    For a constant-thickness sheet (a prism: volume = footprint_area * thickness) this
+    is exact AND orientation-independent. The previous bounding-box-span approach
+    overestimated badly for any plate whose faces were not axis-aligned (the axis span
+    then includes the in-plane dimensions, not just the thickness).
+    """
     body = face.body                                   # (verify: BRepFace.body)
-    bb = body.boundingBox                              # (verify: BRepBody.boundingBox)
-    n = face.geometry.normal; n.normalize()
-    spans = (abs(bb.maxPoint.x - bb.minPoint.x),
-             abs(bb.maxPoint.y - bb.minPoint.y),
-             abs(bb.maxPoint.z - bb.minPoint.z))
-    # project the box extent onto |normal|; for an axis-aligned plate this is the
-    # span along the dominant normal axis:
-    axis = max(range(3), key=lambda i: abs((n.x, n.y, n.z)[i]))
-    return spans[axis]
+    area = face.area                                   # footprint of the flat face (verify: BRepFace.area)
+    vol = body.physicalProperties.volume               # geometric volume (verify: BRepBody.physicalProperties.volume)
+    return vol / area if area > 1e-12 else 0.0
 
 
 def read_material_name(face):

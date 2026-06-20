@@ -45,6 +45,24 @@ def _bbox(pts):
     xs = [p.x for p in pts]; ys = [p.y for p in pts]
     return min(xs), min(ys), max(xs), max(ys)
 
+def _polyline_pair_distance(A, B):
+    """Minimum distance between two sampled polylines, checked in BOTH directions:
+    A-points->B-segments AND B-points->A-segments. A one-sided check can over-report
+    the true minimum when the closest feature is a vertex of one polyline projecting
+    onto the interior of a segment of the other."""
+    best = float("inf")
+    for p in A:
+        for k in range(len(B) - 1):
+            d = point_seg_distance(p, B[k], B[k + 1])
+            if d < best:
+                best = d
+    for p in B:
+        for k in range(len(A) - 1):
+            d = point_seg_distance(p, A[k], A[k + 1])
+            if d < best:
+                best = d
+    return best
+
 def min_profile_distance(profiles, n=12):
     polys = [sample_profile(p, n) for p in profiles]
     boxes = [_bbox(p) for p in polys]
@@ -57,12 +75,9 @@ def min_profile_distance(profiles, n=12):
             gap_y = max(bi[1] - bj[3], bj[1] - bi[3], 0.0)
             if math.hypot(gap_x, gap_y) >= best:
                 continue
-            A, B = polys[i], polys[j]
-            for p in A:
-                for k in range(len(B) - 1):
-                    d = point_seg_distance(p, B[k], B[k + 1])
-                    if d < best:
-                        best = d
+            d = _polyline_pair_distance(polys[i], polys[j])
+            if d < best:
+                best = d
     return best
 
 def fillet_corner(A, B, C, R):
@@ -70,6 +85,9 @@ def fillet_corner(A, B, C, R):
     v1 = v_unit(v_sub(A, B)); v2 = v_unit(v_sub(C, B))
     cosang = max(-1.0, min(1.0, v1.x * v2.x + v1.y * v2.y))
     phi = math.acos(cosang)                      # interior angle at B
+    if phi < 1e-9 or phi > math.pi - 1e-9:
+        # collinear vertices: tan(0)->0 (div-by-zero) or a 180 deg "corner" (no fillet).
+        raise ValueError("fillet_corner: collinear/degenerate vertices, no fillet possible")
     tan_len = R / math.tan(phi / 2.0)
     T1 = v_add(B, v_mul(v1, tan_len))            # tangent point on edge toward A
     T2 = v_add(B, v_mul(v2, tan_len))            # tangent point on edge toward C
@@ -142,21 +160,34 @@ def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th):
 
 
 def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48):
+    """Smallest same-row pitch whose every ligament is >= tab (densest valid pattern).
+
+    Feasibility is monotone: above some boundary pitch the pattern is always valid (the
+    central tab is exactly `tab` by construction and the diagonal ligaments only widen),
+    so a feasible pitch essentially always exists for positive inputs. The search window
+    GROWS until a feasible pitch is found rather than assuming a fixed ceiling -- a fixed
+    1.6*slot_len ceiling falsely reported 'infeasible' when the boundary sat above it.
+    Raises ValueError only past a hard cap (e.g. degenerate cell geometry).
+    """
     th = end_angle_deg
     ext = (gap / 2.0) / math.tan(math.radians(th))
     lo = 2.0 * ext + 0.05 * slot_len     # below this, pointed ends collide
-    hi = 1.6 * slot_len
-    step = (hi - lo) / samples
-    feasible = []
-    p = lo
-    while p <= hi + 1e-12:
-        if _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th) >= tab - 1e-6:
-            feasible.append(p)
-        p += step
-    if not feasible:
-        raise ValueError(
-            "no feasible pitch: tab is too large for this slot length / gap / fillet")
-    return min(feasible)                  # smallest feasible pitch = densest pattern
+    hi = max(1.6 * slot_len, slot_len + 4.0 * (tab + gap))
+    cap = 64.0 * (slot_len + tab + gap)  # backstop against an unbounded loop
+    while True:
+        step = (hi - lo) / samples
+        feasible = []
+        p = lo
+        while p <= hi + 1e-12:
+            if _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th) >= tab - 1e-6:
+                feasible.append(p)
+            p += step
+        if feasible:
+            return min(feasible)         # smallest feasible pitch = densest pattern
+        if hi >= cap:
+            raise ValueError(
+                "no feasible pitch found below cap (degenerate cell geometry?)")
+        lo, hi = hi, min(hi * 2.0, cap)  # feasibility is above -> search the next window
 
 
 def fit_count(bend_len, pitch, margin):
@@ -167,10 +198,11 @@ def fit_count(bend_len, pitch, margin):
 
 
 def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
-    """Invert fit_count: pick the slot_len whose solved pitch yields ~count cells.
+    """Invert fit_count: pick the slot_len whose solved pitch yields ~`count` cells.
 
-    Returns a slot_len such that solve_pitch(result) yields a feasible pitch, or raises
-    ValueError if no feasible pitch exists in the search range (e.g., tab too large).
+    Raises ValueError when `count` cannot fit in `bend_len` -- i.e. the requested count
+    needs a pitch below the smallest achievable one (asking for more slots than the
+    geometry can pack into the bend), or the implied slot is too short to form a cell.
     """
     usable = max(bend_len - 2.0 * margin, 1e-6)
     target_pitch = usable / max(count, 1)
@@ -187,12 +219,16 @@ def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
         else:
             hi = mid
     result = (lo + hi) / 2.0
-    # Guard: verify result actually yields a feasible pitch
+    # Verify the requested count actually fits at the resulting slot length.
     try:
-        solve_pitch(result, gap, tab, fillet_r, end_angle_deg)
+        p = solve_pitch(result, gap, tab, fillet_r, end_angle_deg)
     except ValueError:
-        raise ValueError(
-            f"cannot fit {count} slots: tab too large for this bend length / gap / fillet")
+        raise ValueError(f"cannot fit {count} slots in bend_len={bend_len:.4f} "
+                         f"(implied slot too short to form a cell)")
+    achievable = fit_count(bend_len, p, margin)
+    if achievable < count:
+        raise ValueError(f"cannot fit {count} slots in bend_len={bend_len:.4f} "
+                         f"(smallest pitch {p:.4f} fits at most {achievable})")
     return result
 
 
@@ -218,6 +254,10 @@ def generate_pattern(bend_len, gap, tab, slot_len, fillet_r, end_angle_deg=40.0)
     pitch = solve_pitch(slot_len, gap, tab, fillet_r, th)
     margin = pitch / 2.0                              # solid end margins, half a pitch
     count = fit_count(bend_len, pitch, margin)
+    if count == 0:
+        raise ValueError(
+            f"no cells fit: bend_len={bend_len:.4f} too short for pitch={pitch:.4f} "
+            f"(slot_len={slot_len:.4f}); use a longer bend line or shorter slots")
     span = (count - 1) * pitch
     start = (bend_len - span) / 2.0                   # center the band
     profiles = []

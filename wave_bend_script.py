@@ -30,7 +30,7 @@ THICKNESS_CM = 0.3175
 GAP_CM       = THICKNESS_CM * 0.7
 TAB_CM       = THICKNESS_CM
 SLOT_LEN_CM  = 1.651
-FILLET_CM    = GAP_CM / 2.0
+FILLET_CM    = GAP_CM * 0.3   # must be < gap/2 or build_cell rejects the degenerate ends
 
 
 def run(context):

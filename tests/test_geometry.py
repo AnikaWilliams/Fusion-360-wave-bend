@@ -84,9 +84,15 @@ class TestTessellation(unittest.TestCase):
     def test_solve_pitch_feasible(self):
         p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
         self.assertGreater(p, 0.0)
-    def test_solve_pitch_raises_when_tab_too_large(self):
+    def test_solve_pitch_large_tab_is_feasible(self):
+        # A large tab just spaces the rows farther apart; it is NOT infeasible. The old
+        # fixed 1.6*slot_len ceiling falsely raised here -- the adaptive ceiling must not.
+        p = G.solve_pitch(1.0, 0.1, 0.8, 0.02, 40.0)   # tab = 0.8 * slot_len
+        self.assertGreater(p, 0.0)
+    def test_solve_pitch_propagates_degenerate_cell(self):
+        # fillet >= gap/2 makes build_cell raise; solve_pitch must surface it, not hang.
         with self.assertRaises(ValueError):
-            G.solve_pitch(1.651, self.GAP, 5.0, self.FIL, 40.0)   # absurd tab
+            G.solve_pitch(1.651, self.GAP, self.TAB, self.GAP / 2.0, 40.0)
     def test_pattern_honors_no_ligament_below_tab(self):
         out = G.generate_pattern(10.0, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
         self.assertGreaterEqual(out["min_ligament"], self.TAB - 1e-3)
@@ -103,10 +109,35 @@ class TestTessellation(unittest.TestCase):
         p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
         n = G.fit_count(10.0, p, margin=p / 2)
         self.assertGreaterEqual(n, 1)
-    def test_fit_slot_len_raises_when_infeasible(self):
-        # tab=10.0 cm is absurdly large; no slot_len can yield a feasible pitch
+    def test_fit_slot_len_raises_when_count_cannot_fit(self):
+        # asking for 10000 slots in a 10 cm bend needs a pitch far below the achievable
+        # minimum -> genuinely infeasible
         with self.assertRaises(ValueError):
-            G.fit_slot_len(10.0, 3, self.GAP, 10.0, self.FIL, 40.0, margin=0.0)
+            G.fit_slot_len(10.0, 10000, self.GAP, self.TAB, self.FIL, 40.0, margin=0.0)
+    def test_generate_pattern_raises_when_no_cells_fit(self):
+        # bend shorter than one pitch -> zero cells; must raise, not return inf/empty
+        with self.assertRaises(ValueError):
+            G.generate_pattern(0.3, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
+
+class TestDistanceAndFillet(unittest.TestCase):
+    def _line(self, p, q):
+        return ("line", G.Pt(*p), G.Pt(*q))
+    def test_min_profile_distance_is_symmetric_vertex_to_edge(self):
+        # B's apex vertex sits at x=5.4 (between A's edge samples), 1.0 below A's long
+        # bottom edge. A one-sided A->B scan over-reports (~1.08); the true minimum is the
+        # perpendicular 1.0 found only by also checking B-points against A-segments.
+        A = [self._line((0, 0), (10, 0)), self._line((10, 0), (10, 0.1)),
+             self._line((10, 0.1), (0, 0.1)), self._line((0, 0.1), (0, 0))]
+        B = [self._line((5.4, -1), (4.9, -2)), self._line((4.9, -2), (5.9, -2)),
+             self._line((5.9, -2), (5.4, -1))]
+        self.assertAlmostEqual(G.min_profile_distance([A, B]), 1.0, delta=0.02)
+        self.assertAlmostEqual(G.min_profile_distance([A, B]),
+                               G.min_profile_distance([B, A]), places=6)  # order-independent
+    def test_filleted_polygon_raises_on_collinear_vertices(self):
+        # collinear consecutive vertices would hit tan(0)=0; must raise ValueError, not ZeroDivisionError
+        verts = [G.Pt(0, 0), G.Pt(1, 0), G.Pt(2, 0), G.Pt(2, 1), G.Pt(0, 1)]
+        with self.assertRaises(ValueError):
+            G.filleted_polygon(verts, 0.1)
 
 if __name__ == "__main__":
     unittest.main()
