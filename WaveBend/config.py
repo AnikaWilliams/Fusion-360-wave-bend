@@ -26,4 +26,6 @@ def default_tab_cm(t_cm):
     return t_cm
 
 def default_fillet_cm(gap_cm):
-    return gap_cm / 2.0
+    # Must stay strictly below gap/2 or the angled cell ends collapse (see geometry.build_cell).
+    # 0.3*gap rounds the corners well while keeping the angled ends intact.
+    return gap_cm * 0.3

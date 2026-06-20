@@ -15,8 +15,10 @@ class TestConfig(unittest.TestCase):
         self.assertAlmostEqual(config.default_gap_cm(0.3175, "Mild Steel"), 0.3175 * 0.7)
     def test_default_tab_equals_thickness(self):
         self.assertAlmostEqual(config.default_tab_cm(0.3175), 0.3175)
-    def test_default_fillet_is_half_gap(self):
-        self.assertAlmostEqual(config.default_fillet_cm(0.2), 0.1)
+    def test_default_fillet_below_half_gap(self):
+        # must be < gap/2 (else the angled cell ends collapse); 0.3*gap
+        self.assertAlmostEqual(config.default_fillet_cm(0.2), 0.06)
+        self.assertLess(config.default_fillet_cm(0.2), 0.2 / 2.0)
 
 if __name__ == "__main__":
     unittest.main()

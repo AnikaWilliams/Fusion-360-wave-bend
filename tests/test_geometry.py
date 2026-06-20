@@ -60,13 +60,27 @@ class TestCell(unittest.TestCase):
     def test_cell_raises_when_too_short(self):
         with self.assertRaises(ValueError):
             G.build_cell(0.2, 0.19, 0.2, 40.0)            # fillet bigger than the flat
+    def test_cell_raises_when_fillet_ge_half_gap(self):
+        # fillet == gap/2 collapses the angled ends to zero-length segments
+        with self.assertRaises(ValueError):
+            G.build_cell(1.651, 0.2222, 0.1111, 40.0)     # fillet == gap/2 exactly
+        with self.assertRaises(ValueError):
+            G.build_cell(1.651, 0.2222, 0.15, 40.0)       # fillet > gap/2
+    def test_cell_has_no_degenerate_line_segments(self):
+        # a valid cell (fillet < gap/2) must have only positive-length straight edges
+        cell = G.build_cell(1.651, 0.2222, 0.2222 * 0.3, 40.0)
+        for seg in cell:
+            if seg[0] == "line":
+                _, p0, p1 = seg
+                self.assertGreater(G.v_len(G.v_sub(p1, p0)), 1e-4)
 
 class TestTessellation(unittest.TestCase):
-    # representative cm inputs: t=0.3175 (0.125"), gap=0.7t, tab=t, fillet=gap/2
+    # representative cm inputs: t=0.3175 (0.125"), gap=0.7t, tab=t, fillet=0.3*gap
+    # (fillet must stay < gap/2 or the cell ends degenerate — see TestCell)
     T = 0.3175
     GAP = 0.3175 * 0.7
     TAB = 0.3175
-    FIL = (0.3175 * 0.7) / 2
+    FIL = (0.3175 * 0.7) * 0.3
     def test_solve_pitch_feasible(self):
         p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
         self.assertGreater(p, 0.0)

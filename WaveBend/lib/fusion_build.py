@@ -21,22 +21,34 @@ def _pt3d(origin, u_hat, v_hat, u, v):
 
 
 def local_frame(entity):
-    """Return (origin Point3D, u_hat Vector3D, v_hat Vector3D, length_cm, planar_face)."""
-    # BRepEdge path: edge.geometry is a Line3D; faces[0] gives the sketch plane. (verify)
-    geo = entity.geometry
+    """Return (origin Point3D, u_hat Vector3D, v_hat Vector3D, length_cm, planar_face).
+
+    Accepts a BRepEdge (uses edge.geometry + the adjacent face) OR a SketchLine
+    (uses worldGeometry + the sketch's reference face/plane). A wave bend line is
+    normally an interior sketch line on the flat face, since the pattern straddles it.
+    """
+    if hasattr(entity, "worldGeometry"):               # SketchLine
+        geo = entity.worldGeometry                     # Line3D in model space
+        face = entity.parentSketch.referencePlane      # face/plane the sketch sits on (verify)
+    else:                                              # BRepEdge
+        geo = entity.geometry
+        face = entity.faces.item(0)                    # (verify)
     p0 = geo.startPoint; p1 = geo.endPoint
     u = adsk.core.Vector3D.create(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z)
     length = u.length
     u.normalize()
-    face = entity.faces.item(0) if hasattr(entity, "faces") else None   # (verify)
-    n = face.geometry.normal if face else adsk.core.Vector3D.create(0, 0, 1)
+    n = face.geometry.normal                           # planar face/plane normal (verify)
     n.normalize()
     v = n.crossProduct(u)        # in-plane perpendicular (verify cross order/handedness)
     v.normalize()
     return p0, u, v, length, face
 
 
-def draw_and_cut(comp, pattern, frame, depth_cm):
+_MIN_SEG_CM = 1e-4   # skip sketch lines shorter than this (defensive against degenerate cells)
+
+
+def draw_pattern_sketch(comp, pattern, frame):
+    """Draw every cell profile into ONE new sketch on the frame's face. Returns the sketch."""
     origin, u_hat, v_hat, _length, face = frame
     sk = comp.sketches.add(face)                       # (verify: sketches.add(planarFace))
     lines = sk.sketchCurves.sketchLines
@@ -45,6 +57,8 @@ def draw_and_cut(comp, pattern, frame, depth_cm):
         for seg in profile:
             if seg[0] == "line":
                 _, a, b = seg
+                if math.hypot(b.x - a.x, b.y - a.y) < _MIN_SEG_CM:
+                    continue                           # adjacent arcs already meet; skip the stub
                 lines.addByTwoPoints(_pt3d(origin, u_hat, v_hat, a.x, a.y),
                                      _pt3d(origin, u_hat, v_hat, b.x, b.y))
             else:
@@ -55,16 +69,29 @@ def draw_and_cut(comp, pattern, frame, depth_cm):
                     _pt3d(origin, u_hat, v_hat, a.x, a.y),
                     _pt3d(origin, u_hat, v_hat, mid.x, mid.y),
                     _pt3d(origin, u_hat, v_hat, b.x, b.y))
-    # one cut consuming every closed profile in the sketch
+    return sk
+
+
+def cut_sketch(comp, sk, depth_cm):
+    """One extrude-cut consuming every closed profile in `sk`, through the sheet thickness."""
     prof_coll = adsk.core.ObjectCollection.create()
     for p in sk.profiles:
         prof_coll.add(p)
     extrudes = comp.features.extrudeFeatures
     cut_input = extrudes.createInput(
         prof_coll, adsk.fusion.FeatureOperations.CutFeatureOperation)   # (verify enum)
-    # through-all both directions is safest for a relief cut (verify ExtentDefinition API):
-    cut_input.setAllExtent(adsk.fusion.ExtentDirections.SymmetricExtentDirection)
+    # Symmetric DISTANCE (>= thickness each way) rather than through-all: direction-agnostic
+    # and it does not search for a body on both sides, so it avoids the "body not found"
+    # failure of through-all when one side of the sketch plane is empty. (verify ValueInput)
+    dist = adsk.core.ValueInput.createByReal(depth_cm * 1.25)
+    cut_input.setDistanceExtent(True, dist)            # True = symmetric
     return extrudes.add(cut_input)
+
+
+def draw_and_cut(comp, pattern, frame, depth_cm):
+    """Convenience: draw the pattern sketch, then cut it. Returns the cut feature."""
+    sk = draw_pattern_sketch(comp, pattern, frame)
+    return cut_sketch(comp, sk, depth_cm)
 
 
 # ---- Task 7: read thickness + material from the body --------------------------

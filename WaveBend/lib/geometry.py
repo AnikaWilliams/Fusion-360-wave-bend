@@ -99,6 +99,12 @@ def filleted_polygon(verts, R):
 def build_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, cx=0.0, cy=0.0):
     """Filleted angled-end hexagon cell centered at (cx, cy), long axis along x."""
     th = math.radians(end_angle_deg)
+    # The angled-end straight segment has length proportional to (gap/2 - fillet_r)
+    # for ANY end angle, so fillet_r == gap/2 collapses the ends to zero-length
+    # segments and fillet_r > gap/2 makes them self-intersect. Reject both.
+    if fillet_r >= gap / 2.0:
+        raise ValueError(
+            f"fillet_r={fillet_r:.4f} must be < gap/2={gap / 2.0:.4f} (cell ends degenerate)")
     ext = (gap / 2.0) / math.tan(th)          # how far each pointed end extends past the flats
     a = slot_len / 2.0 - ext                   # half-length of the flat top/bottom edges
     if a <= fillet_r * 1.05:
