@@ -18,6 +18,9 @@ app = adsk.core.Application.get()
 ui = app.userInterface
 
 CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_waveBend'
+# Hidden helper command: CustomFeatures.add is refused outside a command's execute
+# context (and inside previews), so post-commit wrapping runs via this command.
+WRAP_CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_wrapPending'
 CMD_NAME = 'Wave Bend'
 CMD_Description = ('Cut a SendCutSend-style wave relief pattern along selected bend '
                    'lines so the flat part can be folded by hand.')
@@ -52,6 +55,19 @@ _auto = {'thickness': True, 'material': True, 'gap': True, 'tab': True, 'fillet'
 
 # Guard against the watcher reacting to its own rebuild.
 _rebuilding = False
+
+# Custom-feature definition: would give every Wave Bend cut ONE timeline node
+# carrying our wave icon. DISABLED: live testing (2026-07-09) showed Fusion's
+# CustomFeatures.add refuses to wrap features post-hoc — in preview context AND
+# in ordinary/command contexts after the fact ('make params invalid' / None).
+# The API only supports wrapping features created inside the SAME command
+# execution, which conflicts with our isValidResult preview-keep architecture
+# (whose instant-OK + stable multi-select UX we will not sacrifice for an icon).
+# Timeline identity today: named features inside a named 'Wave Bend xN' group.
+# TODO(icon): re-architect as a native custom-feature command (geometry created
+# in execute, compute handler, no preview-keep) if the icon becomes a must-have.
+ENABLE_TIMELINE_ICON = False
+_custom_def = None
 
 # Cached linear pitch model: solve_pitch is too slow to run per dialog edit, but for
 # fixed (gap, tab, fillet, angle, diag) the solved pitch tracks slot_len almost
@@ -153,13 +169,38 @@ def _snapshot_for(body):
     }
 
 
-def _tag_feature(cut, sk, entity, body, params):
+def _wrap_custom_feature(comp, sk, cut, name):
+    """Fold the new features into ONE timeline node carrying the Wave Bend icon.
+    Tries sketch+cut first, then just the cut (a Sketch may not qualify as a
+    range start). Returns the custom feature's entityToken ('' if unavailable)."""
+    if not ENABLE_TIMELINE_ICON or _custom_def is None:
+        return ''
+    cfs = comp.features.customFeatures                     # (verify: customFeatures)
+    for start, end in ((sk, cut), (cut, cut)):
+        try:
+            ci = cfs.createInput(_custom_def)              # (verify: createInput)
+            ci.setStartAndEndFeatures(start, end)          # (verify: setStartAndEndFeatures)
+            cf = cfs.add(ci)
+            try:
+                cf.name = name
+            except Exception:
+                pass
+            return cf.entityToken
+        except Exception:
+            continue
+    futil.log(f'{CMD_NAME}: custom-feature wrap failed (plain features kept):\n'
+              f'{traceback.format_exc()}')
+    return ''
+
+
+def _tag_feature(cut, sk, entity, body, params, custom_token=''):
     """Persist everything the watcher needs to rebuild this cut later."""
     payload = {
         'version': ATTR_VERSION,
         'line_token': entity.entityToken,              # (verify: entityToken)
         'sketch_token': sk.entityToken,
         'body_token': body.entityToken if body else '',
+        'custom_token': custom_token,
         'params': params,
         'auto': dict(_auto),
         'snapshot': _snapshot_for(body) if body else {},
@@ -167,8 +208,12 @@ def _tag_feature(cut, sk, entity, body, params):
     cut.attributes.add(ATTR_GROUP, ATTR_NAME, json.dumps(payload))   # (verify: attributes.add)
 
 
-def _build(inputs):
+def _build(inputs, wrap=True):
     """Shared by preview and execute: solve + cut every selected line.
+
+    wrap=False (preview): skip the custom-feature timeline wrapper — Fusion refuses
+    custom features inside executePreview ('make params invalid'), and previews are
+    rolled back anyway.
 
     Phase 1 (no side effects): resolve frames/bodies, solve EVERY pattern, and run
     every clearance check against the still-pristine bodies. An infeasible
@@ -210,7 +255,8 @@ def _build(inputs):
             frame = FB.local_frame(e)   # re-resolve: an earlier cut may have split a shared face
             name = f'Wave Bend ({pattern["count"]} slots)'
             sk, cut = FB.draw_and_cut(comp, pattern, frame, t, name=name)
-            _tag_feature(cut, sk, e, body, params)
+            cf_token = _wrap_custom_feature(comp, sk, cut, name) if wrap else ''
+            _tag_feature(cut, sk, e, body, params, custom_token=cf_token)
             results.append({'pattern': pattern, 'cut': cut})
         except Exception:
             futil.log(f'{CMD_NAME}: line {i + 1} failed:\n{traceback.format_exc()}')
@@ -254,26 +300,88 @@ def _status_summary(inputs, results, warnings):
 # add-in lifecycle
 # ---------------------------------------------------------------------------
 
+_watcher_handler = None
+
+
 def start():
-    cmd_def = ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER)
-    futil.add_handler(cmd_def.commandCreated, command_created)
+    # Idempotent: clear any stale registration from a previous load in this session
+    # (a stop() that failed half-way leaves a definition behind, and an unguarded
+    # addButtonDefinition would then throw and abort the whole start).
+    stale_def = ui.commandDefinitions.itemById(CMD_ID)
+    if stale_def:
+        try:
+            stale_def.deleteMe()
+        except Exception:
+            pass
     workspace = ui.workspaces.itemById(WORKSPACE_ID)
     panel = workspace.toolbarPanels.itemById(PANEL_ID)
+    stale_ctl = panel.controls.itemById(CMD_ID)
+    if stale_ctl:
+        try:
+            stale_ctl.deleteMe()
+        except Exception:
+            pass
+
+    cmd_def = ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER)
+    futil.add_handler(cmd_def.commandCreated, command_created)
     control = panel.controls.addCommand(cmd_def, COMMAND_BESIDE_ID, False)
     control.isPromoted = IS_PROMOTED
+
+    # The hidden wrap command (no button, no inputs; executes straight through).
+    stale_wrap = ui.commandDefinitions.itemById(WRAP_CMD_ID)
+    if stale_wrap:
+        try:
+            stale_wrap.deleteMe()
+        except Exception:
+            pass
+    wrap_def = ui.commandDefinitions.addButtonDefinition(
+        WRAP_CMD_ID, 'Wave Bend (internal)', 'Internal: applies timeline icons')
+    futil.add_handler(wrap_def.commandCreated, _wrap_cmd_created)
     # Part B: watch for material / sheet-metal-rule changes for as long as we run.
-    futil.add_handler(ui.commandTerminated, on_command_terminated)   # (verify: commandTerminated)
+    # Keep the handler reference so stop() can detach it from the native event —
+    # clear_handlers() alone leaves a zombie watcher alive across reloads.
+    global _watcher_handler
+    _watcher_handler = futil.add_handler(ui.commandTerminated, on_command_terminated)
+    # Timeline identity: the custom-feature definition that puts the Wave Bend icon
+    # on every cut's timeline node. (verify: CustomFeatureDefinition.create)
+    global _custom_def
+    try:
+        _custom_def = adsk.fusion.CustomFeatureDefinition.create(
+            f'{config.COMPANY_NAME}.{config.ADDIN_NAME}.waveBend', CMD_NAME, ICON_FOLDER)
+    except Exception:
+        # e.g. definition already registered from a previous load in this session
+        futil.log(f'{CMD_NAME}: custom-feature definition unavailable:\n{traceback.format_exc()}')
+        _custom_def = None
 
 
 def stop():
+    global _watcher_handler
+    if _watcher_handler is not None:
+        try:
+            ui.commandTerminated.remove(_watcher_handler)   # (verify: Event.remove)
+        except Exception:
+            pass
+        _watcher_handler = None
     workspace = ui.workspaces.itemById(WORKSPACE_ID)
     panel = workspace.toolbarPanels.itemById(PANEL_ID)
     command_control = panel.controls.itemById(CMD_ID)
     command_definition = ui.commandDefinitions.itemById(CMD_ID)
-    if command_control:
-        command_control.deleteMe()
-    if command_definition:
-        command_definition.deleteMe()
+    try:
+        if command_control:
+            command_control.deleteMe()
+    except Exception:
+        pass
+    try:
+        if command_definition:
+            command_definition.deleteMe()
+    except Exception:
+        pass
+    wrap_def = ui.commandDefinitions.itemById(WRAP_CMD_ID)
+    try:
+        if wrap_def:
+            wrap_def.deleteMe()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -452,13 +560,16 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 def command_preview(args: adsk.core.CommandEventArgs):
     """Live preview: build the REAL pattern + cut; Fusion auto-rolls it back on the
-    next input change. isValidResult=True makes OK simply keep the last preview."""
+    next input change. isValidResult=True keeps OK instant AND keeps the selection
+    alive (an invalidated preview clears the selection input). Custom-feature
+    wrapping is impossible inside a preview ('make params invalid'), so the kept
+    result is wrapped AFTER the command completes — see _wrap_pending()."""
     inputs = args.command.commandInputs
     if inputs.itemById('bendLine').selectionCount == 0:
         return
     try:
-        results, warnings = _build(inputs)
-        args.isValidResult = True                      # OK reuses this result instantly
+        results, warnings = _build(inputs, wrap=False)
+        args.isValidResult = True                      # OK keeps this result instantly
         _set_status(inputs, _status_summary(inputs, results, warnings))
         total = sum(r['pattern']['count'] for r in results)
         _log_file('PREVIEW-OK  WaveBend: {} slots on {} line(s); min ligament {:.3f} cm'.format(
@@ -499,11 +610,74 @@ def command_destroy(args: adsk.core.CommandEventArgs):
 _WATCH_HINTS = ('material', 'sheetmetal', 'physicalmaterial')
 
 
+def _wrap_cmd_created(args: adsk.core.CommandCreatedEventArgs):
+    # No inputs: Fusion runs execute immediately, giving us a legal context
+    # for CustomFeatures.add.
+    futil.add_handler(args.command.execute, _wrap_cmd_execute, local_handlers=local_handlers)
+    try:
+        args.command.isAutoExecute = True              # (verify: Command.isAutoExecute)
+    except Exception:
+        pass
+
+
+def _wrap_cmd_execute(args: adsk.core.CommandEventArgs):
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design:
+        _wrap_pending(design)
+
+
+def _trigger_wrap():
+    """Run _wrap_pending inside a command execute context (see WRAP_CMD_ID)."""
+    if not ENABLE_TIMELINE_ICON:
+        return
+    try:
+        wrap_def = ui.commandDefinitions.itemById(WRAP_CMD_ID)
+        if wrap_def:
+            wrap_def.execute()                         # (verify: CommandDefinition.execute)
+    except Exception:
+        futil.log(f'{CMD_NAME}: wrap trigger failed:\n{traceback.format_exc()}')
+
+
+def _wrap_pending(design):
+    """Wrap any tagged Wave Bend cut that has no custom-feature timeline node yet.
+
+    Runs after OUR command terminates: results kept from a preview (isValidResult)
+    could not be wrapped in preview context, so they get their Wave Bend timeline
+    icon here. Also retrofits cuts made by older versions of the add-in."""
+    wrapped = 0
+    comp = design.rootComponent
+    for attr in design.findAttributes(ATTR_GROUP, ATTR_NAME):
+        try:
+            payload = json.loads(attr.value)
+            if payload.get('version') != ATTR_VERSION or payload.get('custom_token'):
+                continue
+            cut = attr.parent
+            if cut is None:
+                continue
+            sketches = design.findEntityByToken(payload.get('sketch_token', ''))
+            sk = sketches[0] if sketches else None
+            name = getattr(cut, 'name', None) or CMD_NAME
+            token = _wrap_custom_feature(comp, sk if sk else cut, cut, name)
+            if token:
+                payload['custom_token'] = token
+                attr.value = json.dumps(payload)       # (verify: Attribute.value settable)
+                wrapped += 1
+        except Exception:
+            continue
+    if wrapped:
+        futil.log(f'{CMD_NAME}: wrapped {wrapped} cut(s) with timeline icon')
+
+
 def on_command_terminated(args):
     global _rebuilding
     try:
         cmd_id = getattr(args, 'commandId', '') or ''
-        if _rebuilding or cmd_id == CMD_ID:
+        if _rebuilding or cmd_id == WRAP_CMD_ID:
+            return
+        if cmd_id == CMD_ID:
+            # Our own command finished: give kept preview results their timeline icon
+            # (via the hidden command — needs a real execute context).
+            _trigger_wrap()
             return
         low = cmd_id.lower()
         if not any(h in low for h in _WATCH_HINTS):
@@ -531,6 +705,8 @@ def on_command_terminated(args):
         finally:
             _rebuilding = False
         _log_file(f'OK  WaveBend auto-update: rebuilt {rebuilt}/{n} feature(s)')
+        if rebuilt:
+            _trigger_wrap()   # rebuilt cuts need their timeline icon re-applied too
     except Exception:
         futil.log(f'WaveBend watcher error:\n{traceback.format_exc()}')
 
@@ -614,11 +790,21 @@ def _rebuild_feature(design, attr, payload):
         return False
 
     try:
-        # Point of no return: delete the old cut + sketch, then rebuild.
+        # Point of no return: delete the old wrapper + cut + sketch, then rebuild.
+        # Deleting the custom-feature wrapper may or may not cascade to its children
+        # depending on API behaviour, so every delete is individually tolerant.
         cut = attr.parent                                              # (verify: Attribute.parent)
+        for cf in design.findEntityByToken(payload.get('custom_token', '')) or []:
+            try:
+                cf.deleteMe()
+            except Exception:
+                pass
         sketches = design.findEntityByToken(payload.get('sketch_token', ''))
-        if cut:
-            cut.deleteMe()
+        try:
+            if cut:
+                cut.deleteMe()
+        except Exception:
+            pass                                       # wrapper delete already took it
         for sk in sketches or []:
             try:
                 sk.deleteMe()
@@ -626,7 +812,9 @@ def _rebuild_feature(design, attr, payload):
                 pass
         frame = FB.local_frame(entity)                 # fresh after the delete
         name = f'Wave Bend ({pattern["count"]} slots)'
-        sk_new, cut_new = FB.draw_and_cut(design.rootComponent, pattern, frame, t, name=name)
+        comp = design.rootComponent
+        sk_new, cut_new = FB.draw_and_cut(comp, pattern, frame, t, name=name)
+        cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name)
         new_params = {'t': t, 'gap': gap, 'tab': tab, 'fil': fil, 'slot': slot,
                       'family': family}
         payload_new = {
@@ -634,6 +822,7 @@ def _rebuild_feature(design, attr, payload):
             'line_token': entity.entityToken,
             'sketch_token': sk_new.entityToken,
             'body_token': body.entityToken,
+            'custom_token': cf_token,
             'params': new_params,
             'auto': auto,
             'snapshot': now,
