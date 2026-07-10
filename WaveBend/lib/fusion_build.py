@@ -122,8 +122,11 @@ def cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=None):
     return extrudes.add(cut_input)
 
 
-def draw_and_cut(comp, pattern, frame, depth_cm):
-    """Convenience: draw the pattern sketch, then cut it. Returns the cut feature."""
+def draw_and_cut(comp, pattern, frame, depth_cm, name=None):
+    """Draw the pattern sketch, then cut it. Returns (sketch, cut_feature).
+
+    If `name` is given, both timeline features get readable names instead of
+    the anonymous 'SketchN' / 'ExtrudeN'."""
     sk = draw_pattern_sketch(comp, pattern, frame)
     # slot-size ceiling for the profile filter: the largest cell bbox diagonal + slack
     diag = 0.0
@@ -132,26 +135,150 @@ def draw_and_cut(comp, pattern, frame, depth_cm):
         w = max(p.x for p in pts) - min(p.x for p in pts)
         h = max(p.y for p in pts) - min(p.y for p in pts)
         diag = max(diag, math.hypot(w, h))
-    return cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=diag * 1.2)
+    cut = cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=diag * 1.2)
+    if name:
+        try:
+            sk.name = f'{name} sketch'                 # (verify: Sketch.name settable)
+            cut.name = name                            # (verify: Feature.name settable)
+        except Exception:
+            pass                                       # cosmetic only; never fail the cut
+    return sk, cut
 
 
-# ---- Task 7: read thickness + material from the body --------------------------
+# ---- body resolution + thickness/material readers ------------------------------
+
+def find_host_body(frame):
+    """The body the bend line lies on: containment of the line midpoint, else nearest.
+
+    Works when the sketch sits on a CONSTRUCTION PLANE (no face to walk from), for
+    sheet-metal parts, and in multi-body files. Returns None only if the design has
+    no solid bodies at all.
+    """
+    origin, u_hat, _v_hat, length, _face = frame
+    mid = _pt3d(origin, u_hat, adsk.core.Vector3D.create(0, 0, 0), length / 2.0, 0.0)
+    design = adsk.fusion.Design.cast(adsk.core.Application.get().activeProduct)
+    root = design.rootComponent
+    bodies = [b for b in root.bRepBodies]
+    for occ in root.allOccurrences:                    # (verify: allOccurrences)
+        bodies.extend(occ.bRepBodies)
+    solid = [b for b in bodies if b.isSolid and b.isVisible]
+    if not solid:
+        return None
+    # 1) a body that contains / touches the midpoint wins
+    for b in solid:
+        try:
+            c = b.pointContainment(mid)                # (verify: BRepBody.pointContainment)
+            if c in (adsk.fusion.PointContainment.PointInsidePointContainment,
+                     adsk.fusion.PointContainment.PointOnPointContainment):
+                return b
+        except Exception:
+            pass
+    # 2) otherwise the nearest body (sketch plane offset above/below the sheet)
+    mm = adsk.core.Application.get().measureManager    # (verify: measureManager)
+    best, best_d = None, float('inf')
+    for b in solid:
+        try:
+            d = mm.measureMinimumDistance(b, mid).value
+        except Exception:
+            continue
+        if d < best_d:
+            best, best_d = b, d
+    return best
+
+
+def _largest_planar_face_area(body):
+    best = 0.0
+    for f in body.faces:
+        try:
+            if f.geometry.objectType == adsk.core.Plane.classType():
+                best = max(best, f.area)
+        except Exception:
+            pass
+    return best
+
+
+def read_thickness_cm(body):
+    """Sheet thickness (cm): the sheet-metal rule when the part has one (exact),
+    else body volume / largest planar face area (exact for any constant-thickness
+    sheet, orientation-independent). Returns 0.0 if undeterminable."""
+    # 1) sheet-metal parts carry the truth in their rule / Thickness parameter
+    try:
+        comp = body.parentComponent
+        rule = getattr(comp, 'activeSheetMetalRule', None)   # (verify: activeSheetMetalRule)
+        if rule:
+            return rule.thickness.value                # (verify: SheetMetalRule.thickness)
+    except Exception:
+        pass
+    try:
+        comp = body.parentComponent
+        for prm in comp.modelParameters:               # sheet-metal 'Thickness' parameter
+            if prm.role == 'ThicknessDimension' or prm.name == 'Thickness':   # (verify)
+                return prm.value
+    except Exception:
+        pass
+    # 2) geometric measurement
+    try:
+        area = _largest_planar_face_area(body)
+        vol = body.physicalProperties.volume
+        return vol / area if area > 1e-12 else 0.0
+    except Exception:
+        return 0.0
+
+
+def read_material_names(body):
+    """(physical_material_name, sheetmetal_rule_name) — either may be ''. The rule
+    name often carries the alloy (e.g. '.063\" 5052') when the physical material is
+    still the generic default."""
+    phys = ''
+    try:
+        mat = getattr(body, 'material', None)          # (verify: BRepBody.material)
+        phys = mat.name if mat else ''
+    except Exception:
+        pass
+    rule = ''
+    try:
+        r = getattr(body.parentComponent, 'activeSheetMetalRule', None)
+        rule = r.name if r else ''
+    except Exception:
+        pass
+    return phys, rule
+
+
+def pattern_clearance_ok(body, frame, pattern):
+    """True if the pattern band lies on the body (no slot runs past an edge or into
+    a cutout). Samples the band rectangle's corners/edge-midpoints just inside the
+    band and checks point containment against the host body."""
+    if body is None:
+        return True                                    # nothing to check against
+    pts = []
+    for prof in pattern["profiles"]:
+        pts.extend(G.sample_profile(prof, n=4))
+    if not pts:
+        return True
+    umin = min(p.x for p in pts); umax = max(p.x for p in pts)
+    vmin = min(p.y for p in pts); vmax = max(p.y for p in pts)
+    origin, u_hat, v_hat, _length, _face = frame
+    probes = [(u, v)
+              for u in (umin, (umin + umax) / 2.0, umax)
+              for v in (vmin, 0.0, vmax)]
+    for (u, v) in probes:
+        p = _pt3d(origin, u_hat, v_hat, u, v)
+        try:
+            c = body.pointContainment(p)
+            if c == adsk.fusion.PointContainment.PointOutsidePointContainment:
+                return False
+        except Exception:
+            continue                                   # can't check THIS probe; try the rest
+    return True
+
+
+# ---- legacy face-based readers (kept for the Stage-1a scripts) ------------------
 
 def measure_thickness_cm(face):
-    """Sheet thickness (cm) = body volume / selected-face area.
-
-    For a constant-thickness sheet (a prism: volume = footprint_area * thickness) this
-    is exact AND orientation-independent. The previous bounding-box-span approach
-    overestimated badly for any plate whose faces were not axis-aligned (the axis span
-    then includes the in-plane dimensions, not just the thickness).
-    """
-    body = face.body                                   # (verify: BRepFace.body)
-    area = face.area                                   # footprint of the flat face (verify: BRepFace.area)
-    vol = body.physicalProperties.volume               # geometric volume (verify: BRepBody.physicalProperties.volume)
-    return vol / area if area > 1e-12 else 0.0
+    """Deprecated in favour of read_thickness_cm(body); kept for the scripts."""
+    return read_thickness_cm(face.body)
 
 
 def read_material_name(face):
-    body = face.body
-    mat = getattr(body, "material", None)              # (verify: BRepBody.material)
+    mat = getattr(face.body, "material", None)
     return mat.name if mat else ""

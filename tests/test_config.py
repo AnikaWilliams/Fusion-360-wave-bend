@@ -20,5 +20,24 @@ class TestConfig(unittest.TestCase):
         self.assertAlmostEqual(config.default_fillet_cm(0.2), 0.06)
         self.assertLess(config.default_fillet_cm(0.2), 0.2 / 2.0)
 
+class TestMaterialFamily(unittest.TestCase):
+    def test_family_words(self):
+        self.assertEqual(config.material_family("Aluminum 6061"), config.FAMILY_ALUMINUM)
+        self.assertEqual(config.material_family("Stainless Steel"), config.FAMILY_STAINLESS)
+        self.assertEqual(config.material_family("Steel"), config.FAMILY_MILD_STEEL)
+        self.assertEqual(config.material_family("Titanium"), config.FAMILY_TITANIUM)
+    def test_alloy_hints_from_sheetmetal_rule_names(self):
+        # rule names often carry only the alloy, e.g. Fusion's '.063" 5052'
+        self.assertEqual(config.material_family('.063" 5052'), config.FAMILY_ALUMINUM)
+        self.assertEqual(config.material_family("2mm 304"), config.FAMILY_STAINLESS)
+        self.assertEqual(config.material_family("Ti-6Al-4V"), config.FAMILY_TITANIUM)
+    def test_stainless_wins_over_steel_and_family_over_alloy(self):
+        self.assertEqual(config.material_family("Stainless Steel 5052-ish"),
+                         config.FAMILY_STAINLESS)
+    def test_unrecognized_returns_none(self):
+        self.assertIsNone(config.material_family("Acrylic"))
+        self.assertIsNone(config.material_family(""))
+        self.assertIsNone(config.material_family(None))
+
 if __name__ == "__main__":
     unittest.main()
