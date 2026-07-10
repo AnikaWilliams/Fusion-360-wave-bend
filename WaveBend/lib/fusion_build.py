@@ -147,6 +147,81 @@ def draw_and_cut(comp, pattern, frame, depth_cm, name=None):
 
 # ---- body resolution + thickness/material readers ------------------------------
 
+def frame_from_points(p0_xyz, p1_xyz):
+    """Rebuild a bend-line frame from raw endpoint coordinates (cm).
+
+    Entity references (tokens, faces, sketch lines) can be invalidated or even
+    REMAPPED by Fusion's preview rollback — live-tested: a cached SketchLine token
+    resolved to a sibling line after rollback. Raw coordinates cannot lie. The
+    hosting face is re-found fresh from the geometry every time.
+    Returns the same tuple local_frame does, or raises RuntimeError."""
+    p0 = adsk.core.Point3D.create(*p0_xyz)
+    p1 = adsk.core.Point3D.create(*p1_xyz)
+    u = adsk.core.Vector3D.create(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z)
+    length = u.length
+    if length < 1e-6:
+        raise RuntimeError('cached bend line is degenerate')
+    u.normalize()
+    mid = adsk.core.Point3D.create((p0.x + p1.x) / 2.0, (p0.y + p1.y) / 2.0,
+                                   (p0.z + p1.z) / 2.0)
+    body = _body_at_point(mid)
+    if body is None:
+        raise RuntimeError('no solid body found near the cached bend line')
+    face = _face_containing(body, p0, p1)
+    if face is None:
+        raise RuntimeError('no planar face of the host body contains the bend line')
+    n = face.geometry.normal
+    n.normalize()
+    v = n.crossProduct(u)
+    v.normalize()
+    return p0, u, v, length, face
+
+
+def _face_containing(body, p0, p1):
+    """The planar face of `body` on which both points lie (within tolerance)."""
+    mm = adsk.core.Application.get().measureManager
+    best, best_d = None, 1e-3                          # 10 µm acceptance
+    for f in body.faces:
+        try:
+            if f.geometry.objectType != adsk.core.Plane.classType():
+                continue
+            d = max(mm.measureMinimumDistance(f, p0).value,
+                    mm.measureMinimumDistance(f, p1).value)
+            if d < best_d:
+                best, best_d = f, d
+        except Exception:
+            continue
+    return best
+
+
+def _body_at_point(pt):
+    """Solid body containing/touching the point, else the nearest one."""
+    design = adsk.fusion.Design.cast(adsk.core.Application.get().activeProduct)
+    root = design.rootComponent
+    bodies = [b for b in root.bRepBodies]
+    for occ in root.allOccurrences:
+        bodies.extend(occ.bRepBodies)
+    solid = [b for b in bodies if b.isSolid and b.isVisible]
+    for b in solid:
+        try:
+            c = b.pointContainment(pt)
+            if c in (adsk.fusion.PointContainment.PointInsidePointContainment,
+                     adsk.fusion.PointContainment.PointOnPointContainment):
+                return b
+        except Exception:
+            pass
+    mm = adsk.core.Application.get().measureManager
+    best, best_d = None, float('inf')
+    for b in solid:
+        try:
+            d = mm.measureMinimumDistance(b, pt).value
+        except Exception:
+            continue
+        if d < best_d:
+            best, best_d = b, d
+    return best
+
+
 def find_host_body(frame):
     """The body the bend line lies on: containment of the line midpoint, else nearest.
 
@@ -156,34 +231,7 @@ def find_host_body(frame):
     """
     origin, u_hat, _v_hat, length, _face = frame
     mid = _pt3d(origin, u_hat, adsk.core.Vector3D.create(0, 0, 0), length / 2.0, 0.0)
-    design = adsk.fusion.Design.cast(adsk.core.Application.get().activeProduct)
-    root = design.rootComponent
-    bodies = [b for b in root.bRepBodies]
-    for occ in root.allOccurrences:                    # (verify: allOccurrences)
-        bodies.extend(occ.bRepBodies)
-    solid = [b for b in bodies if b.isSolid and b.isVisible]
-    if not solid:
-        return None
-    # 1) a body that contains / touches the midpoint wins
-    for b in solid:
-        try:
-            c = b.pointContainment(mid)                # (verify: BRepBody.pointContainment)
-            if c in (adsk.fusion.PointContainment.PointInsidePointContainment,
-                     adsk.fusion.PointContainment.PointOnPointContainment):
-                return b
-        except Exception:
-            pass
-    # 2) otherwise the nearest body (sketch plane offset above/below the sheet)
-    mm = adsk.core.Application.get().measureManager    # (verify: measureManager)
-    best, best_d = None, float('inf')
-    for b in solid:
-        try:
-            d = mm.measureMinimumDistance(b, mid).value
-        except Exception:
-            continue
-        if d < best_d:
-            best, best_d = b, d
-    return best
+    return _body_at_point(mid)
 
 
 def _largest_planar_face_area(body):

@@ -66,9 +66,11 @@ _rebuilding = False
 ENABLE_TIMELINE_ICON = True
 _custom_def = None
 
-# Selection safety net: if a preview rollback ever drops the visual selection,
-# these tokens keep OK enabled and let execute rebuild the entity list.
-_cached_line_tokens = []
+# Selection safety net: the preview rollback drops the visual selection AND can
+# remap entity tokens (live-tested: a cached SketchLine token resolved to a SIBLING
+# line after rollback, cutting along the wrong line). So we cache the lines' raw
+# GEOMETRY — endpoint coordinates in cm — and rebuild frames from coordinates.
+_cached_line_geoms = []          # [((x0,y0,z0), (x1,y1,z1)), ...]
 
 # Cached linear pitch model: solve_pitch is too slow to run per dialog edit, but for
 # fixed (gap, tab, fillet, angle, diag) the solved pitch tracks slot_len almost
@@ -132,31 +134,33 @@ def _selected_entities(inputs):
     return [sel.selection(i).entity for i in range(sel.selectionCount)]
 
 
-def _entities_for_build(inputs):
-    """Live selection when present, else the cached tokens (a preview rollback can
-    clear the visible selection; the cache keeps the command working)."""
+def _line_geom(entity):
+    """((x0,y0,z0),(x1,y1,z1)) for a SketchLine (worldGeometry) or linear BRepEdge."""
+    geo = entity.worldGeometry if hasattr(entity, 'worldGeometry') else entity.geometry
+    p0, p1 = geo.startPoint, geo.endPoint
+    return ((p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z))
+
+
+def _frames_for_build(inputs):
+    """Frames for every bend line: from the live selection when present, else
+    rebuilt from the cached endpoint coordinates (immune to entity invalidation)."""
     ents = _selected_entities(inputs)
     if ents:
-        return ents
-    design = adsk.fusion.Design.cast(app.activeProduct)
-    if not design:
-        return []
-    resolved = []
-    for tok in _cached_line_tokens:
-        found = design.findEntityByToken(tok)
-        if found:
-            resolved.append(found[0])
-    return resolved
+        return [FB.local_frame(e) for e in ents]
+    return [FB.frame_from_points(p0, p1) for (p0, p1) in _cached_line_geoms]
 
 
 def _bend_len(inputs):
-    ents = _entities_for_build(inputs)
-    if not ents:
-        return 0.0
-    try:
-        return FB.local_frame(ents[0])[3]
-    except Exception:
-        return 0.0
+    ents = _selected_entities(inputs)
+    if ents:
+        try:
+            return FB.local_frame(ents[0])[3]
+        except Exception:
+            return 0.0
+    if _cached_line_geoms:
+        (p0, p1) = _cached_line_geoms[0]
+        return math.dist(p0, p1)
+    return 0.0
 
 
 def _set_status(inputs, text):
@@ -192,9 +196,10 @@ def _wrap_custom_feature(comp, sk, cut, name):
     Tries sketch+cut first, then just the cut (a Sketch may not qualify as a
     range start). Returns the custom feature's entityToken ('' if unavailable)."""
     if not ENABLE_TIMELINE_ICON or _custom_def is None:
+        futil.log(f'WRAP skip: enable={ENABLE_TIMELINE_ICON} def={_custom_def}', force_console=True)
         return ''
     cfs = comp.features.customFeatures                     # (verify: customFeatures)
-    for start, end in ((sk, cut), (cut, cut)):
+    for label, start, end in (('sk+cut', sk, cut), ('cut only', cut, cut)):
         try:
             ci = cfs.createInput(_custom_def)              # (verify: createInput)
             ci.setStartAndEndFeatures(start, end)          # (verify: setStartAndEndFeatures)
@@ -203,19 +208,24 @@ def _wrap_custom_feature(comp, sk, cut, name):
                 cf.name = name
             except Exception:
                 pass
+            futil.log(f'WRAP OK ({label}): {name}', force_console=True)
             return cf.entityToken
-        except Exception:
+        except Exception as e:
+            futil.log(f'WRAP attempt {label} failed: {type(e).__name__}: {e}', force_console=True)
             continue
-    futil.log(f'{CMD_NAME}: custom-feature wrap failed (plain features kept):\n'
-              f'{traceback.format_exc()}')
+    futil.log(f'{CMD_NAME}: custom-feature wrap failed (plain features kept)', force_console=True)
     return ''
 
 
-def _tag_feature(cut, sk, entity, body, params, custom_token=''):
-    """Persist everything the watcher needs to rebuild this cut later."""
+def _tag_feature(cut, sk, line_geom, body, params, custom_token=''):
+    """Persist everything the watcher needs to rebuild this cut later.
+
+    The bend line is stored as raw endpoint COORDINATES (line_geom) — entity
+    tokens proved unstable across preview rollbacks (they can remap to sibling
+    sketch lines), and coordinates survive anything."""
     payload = {
         'version': ATTR_VERSION,
-        'line_token': entity.entityToken,              # (verify: entityToken)
+        'line_geom': line_geom,                        # ((x0,y0,z0),(x1,y1,z1)) cm
         'sketch_token': sk.entityToken,
         'body_token': body.entityToken if body else '',
         'custom_token': custom_token,
@@ -243,7 +253,7 @@ def _build(inputs, sketch_only=False):
     cannot orphan the others silently.
     Returns (results, warnings).
     """
-    entities = _entities_for_build(inputs)
+    frames = _frames_for_build(inputs)
     t = inputs.itemById('thickness').value
     gap = inputs.itemById('gap').value
     tab = inputs.itemById('tab').value
@@ -260,19 +270,25 @@ def _build(inputs, sketch_only=False):
 
     # ---- phase 1: validate everything against pristine geometry ----
     jobs, warnings = [], []
-    for i, e in enumerate(entities):
-        frame = FB.local_frame(e)
+    for i, frame in enumerate(frames):
         body = FB.find_host_body(frame)
         pattern = _get_pattern(frame[3], gap, tab, fil, slot)   # may raise ValueError
         if not FB.pattern_clearance_ok(body, frame, pattern):
             warnings.append(f'line {i + 1}: pattern extends past the part edge or into a cutout')
-        jobs.append((e, body, pattern))
+        origin, u_hat, _v, length, _f = frame
+        line_geom = ((origin.x, origin.y, origin.z),
+                     (origin.x + u_hat.x * length, origin.y + u_hat.y * length,
+                      origin.z + u_hat.z * length))
+        jobs.append((line_geom, body, pattern))
 
     # ---- phase 2: build, isolated per line ----
     results, failures, wrapped_all = [], [], True
-    for i, (e, body, pattern) in enumerate(jobs):
+    for i, (line_geom, body, pattern) in enumerate(jobs):
+        sk = None
         try:
-            frame = FB.local_frame(e)   # re-resolve: an earlier cut may have split a shared face
+            # ALWAYS re-resolve the frame from raw coordinates: an earlier cut may
+            # have split/replaced the face, and coordinate lookup is immune to that.
+            frame = FB.frame_from_points(*line_geom)
             name = f'Wave Bend ({pattern["count"]} slots)'
             if sketch_only:
                 FB.draw_pattern_sketch(comp, pattern, frame)
@@ -282,11 +298,16 @@ def _build(inputs, sketch_only=False):
             cf_token = _wrap_custom_feature(comp, sk, cut, name)
             if not cf_token:
                 wrapped_all = False
-            _tag_feature(cut, sk, e, body, params, custom_token=cf_token)
+            _tag_feature(cut, sk, line_geom, body, params, custom_token=cf_token)
             results.append({'pattern': pattern, 'cut': cut})
         except Exception:
             futil.log(f'{CMD_NAME}: line {i + 1} failed:\n{traceback.format_exc()}')
             failures.append(i + 1)
+            if sk is not None:
+                try:
+                    sk.deleteMe()                      # never leave an orphan sketch behind
+                except Exception:
+                    pass
 
     # Fallback timeline identity: only when some cut did NOT get its custom-feature
     # node (the custom feature IS the readable timeline entry otherwise).
@@ -421,9 +442,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
     units = _units()
 
-    global _auto, _cached_line_tokens
+    global _auto, _cached_line_geoms
     _auto = {'thickness': True, 'material': True, 'gap': True, 'tab': True, 'fillet': True}
-    _cached_line_tokens = []
+    _cached_line_geoms = []
 
     sel = inputs.addSelectionInput('bendLine', 'Bend lines',
                                    'Select straight edges or sketch lines on the flat face')
@@ -560,8 +581,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         if cid == 'bendLine':
             live = _selected_entities(inputs)
             if live:                                   # cache tokens as the safety net
-                global _cached_line_tokens
-                _cached_line_tokens = [e.entityToken for e in live]
+                global _cached_line_geoms
+                _cached_line_geoms = [_line_geom(e) for e in live]
             _reseed_from_body(inputs)
             _refresh_count(inputs)
         elif cid in ('thickness', 'material'):
@@ -580,7 +601,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     inputs = args.inputs
     try:
-        ok = ((inputs.itemById('bendLine').selectionCount >= 1 or bool(_cached_line_tokens))
+        ok = ((inputs.itemById('bendLine').selectionCount >= 1 or bool(_cached_line_geoms))
               and inputs.itemById('thickness').value > 0
               and inputs.itemById('gap').value > 0
               and inputs.itemById('tab').value > 0
@@ -597,7 +618,7 @@ def command_preview(args: adsk.core.CommandEventArgs):
     selection, and the preview is fast. The real cut + custom-feature wrap happen
     in execute (isValidResult stays False so execute always runs on OK)."""
     inputs = args.command.commandInputs
-    if not _entities_for_build(inputs):
+    if inputs.itemById('bendLine').selectionCount == 0 and not _cached_line_geoms:
         return
     try:
         results, warnings = _build(inputs, sketch_only=True)
@@ -767,11 +788,14 @@ def _rebuild_feature(design, attr, payload):
     leaves the existing cut untouched. Only a hard Fusion API failure after the
     delete can lose the feature — and that is reported loudly, not swallowed."""
     try:
-        lines = design.findEntityByToken(payload.get('line_token', ''))
-        if not lines:
-            futil.log('WaveBend update: bend line no longer exists; skipping one feature')
-            return False
-        entity = lines[0]
+        line_geom = payload.get('line_geom')
+        if not line_geom:
+            # legacy payload (token-based): tokens proved unstable — resolve but verify
+            lines = design.findEntityByToken(payload.get('line_token', ''))
+            if not lines:
+                futil.log('WaveBend update: bend line no longer exists; skipping one feature')
+                return False
+            line_geom = _line_geom(lines[0])
         # Re-resolve the body NOW: earlier rebuilds in this batch may have replaced
         # timeline state, and a pre-resolved handle could be stale.
         bodies = design.findEntityByToken(payload.get('body_token', ''))
@@ -797,7 +821,7 @@ def _rebuild_feature(design, attr, payload):
         slot = params['slot']
 
         # Validate the new pattern BEFORE touching the old feature.
-        frame = FB.local_frame(entity)
+        frame = FB.frame_from_points(*line_geom)
         pattern = _get_pattern(frame[3], gap, tab, fil, slot)   # ValueError -> untouched
     except ValueError as e:
         futil.log(f'WaveBend update: new parameters infeasible, feature left as-is: {e}')
@@ -827,7 +851,7 @@ def _rebuild_feature(design, attr, payload):
                 sk.deleteMe()
             except Exception:
                 pass
-        frame = FB.local_frame(entity)                 # fresh after the delete
+        frame = FB.frame_from_points(*line_geom)       # fresh after the delete
         name = f'Wave Bend ({pattern["count"]} slots)'
         comp = design.rootComponent
         sk_new, cut_new = FB.draw_and_cut(comp, pattern, frame, t, name=name)
@@ -836,7 +860,7 @@ def _rebuild_feature(design, attr, payload):
                       'family': family}
         payload_new = {
             'version': ATTR_VERSION,
-            'line_token': entity.entityToken,
+            'line_geom': line_geom,
             'sketch_token': sk_new.entityToken,
             'body_token': body.entityToken,
             'custom_token': cf_token,
