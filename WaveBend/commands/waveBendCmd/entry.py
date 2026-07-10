@@ -57,17 +57,18 @@ _auto = {'thickness': True, 'material': True, 'gap': True, 'tab': True, 'fillet'
 _rebuilding = False
 
 # Custom-feature definition: would give every Wave Bend cut ONE timeline node
-# carrying our wave icon. DISABLED: live testing (2026-07-09) showed Fusion's
-# CustomFeatures.add refuses to wrap features post-hoc — in preview context AND
-# in ordinary/command contexts after the fact ('make params invalid' / None).
-# The API only supports wrapping features created inside the SAME command
-# execution, which conflicts with our isValidResult preview-keep architecture
-# (whose instant-OK + stable multi-select UX we will not sacrifice for an icon).
-# Timeline identity today: named features inside a named 'Wave Bend xN' group.
-# TODO(icon): re-architect as a native custom-feature command (geometry created
-# in execute, compute handler, no preview-keep) if the icon becomes a must-have.
-ENABLE_TIMELINE_ICON = False
+# carrying our wave icon. Constraint (live-tested 2026-07-09): CustomFeatures.add
+# only wraps features created inside the SAME command execution — never post-hoc,
+# never in a preview. Architecture therefore: executePreview draws the OUTLINE
+# sketch only (nothing destructive -> nothing rolls back -> selection stays);
+# execute creates sketch+cut AND wraps them right there. Fallback on any wrap
+# failure: plain named features in a named group — a cut is never lost.
+ENABLE_TIMELINE_ICON = True
 _custom_def = None
+
+# Selection safety net: if a preview rollback ever drops the visual selection,
+# these tokens keep OK enabled and let execute rebuild the entity list.
+_cached_line_tokens = []
 
 # Cached linear pitch model: solve_pitch is too slow to run per dialog edit, but for
 # fixed (gap, tab, fillet, angle, diag) the solved pitch tracks slot_len almost
@@ -131,8 +132,25 @@ def _selected_entities(inputs):
     return [sel.selection(i).entity for i in range(sel.selectionCount)]
 
 
-def _bend_len(inputs):
+def _entities_for_build(inputs):
+    """Live selection when present, else the cached tokens (a preview rollback can
+    clear the visible selection; the cache keeps the command working)."""
     ents = _selected_entities(inputs)
+    if ents:
+        return ents
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design:
+        return []
+    resolved = []
+    for tok in _cached_line_tokens:
+        found = design.findEntityByToken(tok)
+        if found:
+            resolved.append(found[0])
+    return resolved
+
+
+def _bend_len(inputs):
+    ents = _entities_for_build(inputs)
     if not ents:
         return 0.0
     try:
@@ -208,22 +226,24 @@ def _tag_feature(cut, sk, entity, body, params, custom_token=''):
     cut.attributes.add(ATTR_GROUP, ATTR_NAME, json.dumps(payload))   # (verify: attributes.add)
 
 
-def _build(inputs, wrap=True):
-    """Shared by preview and execute: solve + cut every selected line.
+def _build(inputs, sketch_only=False):
+    """Shared by preview and execute: solve every selected line, then build.
 
-    wrap=False (preview): skip the custom-feature timeline wrapper — Fusion refuses
-    custom features inside executePreview ('make params invalid'), and previews are
-    rolled back anyway.
+    sketch_only=True (preview): draw ONLY the wave outline sketches — no cut, no
+    wrapper. Nothing destructive happens, so the preview rollback has nothing to
+    invalidate (keeps the selection input alive) and it is fast.
+    sketch_only=False (execute): sketch + cut + custom-feature wrap, all inside
+    THIS command execution — the only context Fusion allows the wrap in.
 
     Phase 1 (no side effects): resolve frames/bodies, solve EVERY pattern, and run
     every clearance check against the still-pristine bodies. An infeasible
     combination raises here, before any geometry exists — so a multi-line build
     never half-commits because of a bad parameter set.
-    Phase 2: cut line by line, isolated per line, so one line's API failure cannot
-    orphan the others silently.
+    Phase 2: build line by line, isolated per line, so one line's API failure
+    cannot orphan the others silently.
     Returns (results, warnings).
     """
-    entities = _selected_entities(inputs)
+    entities = _entities_for_build(inputs)
     t = inputs.itemById('thickness').value
     gap = inputs.itemById('gap').value
     tab = inputs.itemById('tab').value
@@ -248,28 +268,36 @@ def _build(inputs, wrap=True):
             warnings.append(f'line {i + 1}: pattern extends past the part edge or into a cutout')
         jobs.append((e, body, pattern))
 
-    # ---- phase 2: cut, isolated per line ----
-    results, failures = [], []
+    # ---- phase 2: build, isolated per line ----
+    results, failures, wrapped_all = [], [], True
     for i, (e, body, pattern) in enumerate(jobs):
         try:
             frame = FB.local_frame(e)   # re-resolve: an earlier cut may have split a shared face
             name = f'Wave Bend ({pattern["count"]} slots)'
+            if sketch_only:
+                FB.draw_pattern_sketch(comp, pattern, frame)
+                results.append({'pattern': pattern, 'cut': None})
+                continue
             sk, cut = FB.draw_and_cut(comp, pattern, frame, t, name=name)
-            cf_token = _wrap_custom_feature(comp, sk, cut, name) if wrap else ''
+            cf_token = _wrap_custom_feature(comp, sk, cut, name)
+            if not cf_token:
+                wrapped_all = False
             _tag_feature(cut, sk, e, body, params, custom_token=cf_token)
             results.append({'pattern': pattern, 'cut': cut})
         except Exception:
             futil.log(f'{CMD_NAME}: line {i + 1} failed:\n{traceback.format_exc()}')
             failures.append(i + 1)
 
-    # One readable timeline group around everything we just made.
-    try:
-        end = design.timeline.count - 1
-        if end > timeline_start and results:
-            grp = design.timeline.timelineGroups.add(timeline_start, end)   # (verify)
-            grp.name = f'Wave Bend x{len(results)}'
-    except Exception:
-        pass                                           # cosmetic only
+    # Fallback timeline identity: only when some cut did NOT get its custom-feature
+    # node (the custom feature IS the readable timeline entry otherwise).
+    if not sketch_only and not wrapped_all:
+        try:
+            end = design.timeline.count - 1
+            if end > timeline_start and results:
+                grp = design.timeline.timelineGroups.add(timeline_start, end)   # (verify)
+                grp.name = f'Wave Bend x{len(results)}'
+        except Exception:
+            pass                                       # cosmetic only
 
     if failures and not results:
         raise RuntimeError(f'all {len(failures)} line(s) failed to cut — see Text Commands')
@@ -393,8 +421,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
     units = _units()
 
-    global _auto
+    global _auto, _cached_line_tokens
     _auto = {'thickness': True, 'material': True, 'gap': True, 'tab': True, 'fillet': True}
+    _cached_line_tokens = []
 
     sel = inputs.addSelectionInput('bendLine', 'Bend lines',
                                    'Select straight edges or sketch lines on the flat face')
@@ -529,6 +558,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     _suppress = True
     try:
         if cid == 'bendLine':
+            live = _selected_entities(inputs)
+            if live:                                   # cache tokens as the safety net
+                global _cached_line_tokens
+                _cached_line_tokens = [e.entityToken for e in live]
             _reseed_from_body(inputs)
             _refresh_count(inputs)
         elif cid in ('thickness', 'material'):
@@ -547,7 +580,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     inputs = args.inputs
     try:
-        ok = (inputs.itemById('bendLine').selectionCount >= 1
+        ok = ((inputs.itemById('bendLine').selectionCount >= 1 or bool(_cached_line_tokens))
               and inputs.itemById('thickness').value > 0
               and inputs.itemById('gap').value > 0
               and inputs.itemById('tab').value > 0
@@ -559,17 +592,15 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
-    """Live preview: build the REAL pattern + cut; Fusion auto-rolls it back on the
-    next input change. isValidResult=True keeps OK instant AND keeps the selection
-    alive (an invalidated preview clears the selection input). Custom-feature
-    wrapping is impossible inside a preview ('make params invalid'), so the kept
-    result is wrapped AFTER the command completes — see _wrap_pending()."""
+    """Live preview: draw the wave OUTLINE sketches only. No cut and no wrapper —
+    nothing destructive, so the rollback between edits can't invalidate the
+    selection, and the preview is fast. The real cut + custom-feature wrap happen
+    in execute (isValidResult stays False so execute always runs on OK)."""
     inputs = args.command.commandInputs
-    if inputs.itemById('bendLine').selectionCount == 0:
+    if not _entities_for_build(inputs):
         return
     try:
-        results, warnings = _build(inputs, wrap=False)
-        args.isValidResult = True                      # OK keeps this result instantly
+        results, warnings = _build(inputs, sketch_only=True)
         _set_status(inputs, _status_summary(inputs, results, warnings))
         total = sum(r['pattern']['count'] for r in results)
         _log_file('PREVIEW-OK  WaveBend: {} slots on {} line(s); min ligament {:.3f} cm'.format(
@@ -583,13 +614,15 @@ def command_preview(args: adsk.core.CommandEventArgs):
 
 
 def command_execute(args: adsk.core.CommandEventArgs):
-    """Fallback path: only runs if the last preview was not marked valid."""
+    """The real build: sketch + cut + custom-feature wrap (same-execution context)."""
     futil.log(f'{CMD_NAME} Command Execute Event')
     try:
         inputs = args.command.commandInputs
-        results, warnings = _build(inputs)
+        results, warnings = _build(inputs, sketch_only=False)
         total = sum(r['pattern']['count'] for r in results)
-        _log_file('OK  WaveBend add-in: {} slots on {} line(s)'.format(total, len(results)))
+        wrapped = sum(1 for r in results if r['cut'] is not None)
+        _log_file('OK  WaveBend add-in: {} slots on {} line(s) ({} feature node(s))'.format(
+            total, len(results), wrapped))
     except Exception:
         _log_file('FAIL WaveBend add-in execute:\n' + traceback.format_exc())
         ui.messageBox('Wave Bend failed — see last_run.log / Text Commands for details.')
@@ -610,74 +643,56 @@ def command_destroy(args: adsk.core.CommandEventArgs):
 _WATCH_HINTS = ('material', 'sheetmetal', 'physicalmaterial')
 
 
+# Rebuild jobs handed from the watcher (no command context) to the hidden
+# command's execute (legal context for CustomFeatures.add): list of (attr, payload).
+_pending_rebuilds = []
+
+
 def _wrap_cmd_created(args: adsk.core.CommandCreatedEventArgs):
     # No inputs: Fusion runs execute immediately, giving us a legal context
-    # for CustomFeatures.add.
-    futil.add_handler(args.command.execute, _wrap_cmd_execute, local_handlers=local_handlers)
+    # for CustomFeatures.add during material-change rebuilds.
+    futil.add_handler(args.command.execute, _rebuild_cmd_execute, local_handlers=local_handlers)
     try:
         args.command.isAutoExecute = True              # (verify: Command.isAutoExecute)
     except Exception:
         pass
 
 
-def _wrap_cmd_execute(args: adsk.core.CommandEventArgs):
-    design = adsk.fusion.Design.cast(app.activeProduct)
-    if design:
-        _wrap_pending(design)
-
-
-def _trigger_wrap():
-    """Run _wrap_pending inside a command execute context (see WRAP_CMD_ID)."""
-    if not ENABLE_TIMELINE_ICON:
+def _rebuild_cmd_execute(args: adsk.core.CommandEventArgs):
+    """Perform the queued material-change rebuilds inside a command execution, so
+    the rebuilt cuts get their custom-feature timeline node back."""
+    global _pending_rebuilds, _rebuilding
+    jobs, _pending_rebuilds = _pending_rebuilds, []
+    if not jobs:
         return
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design:
+        return
+    _rebuilding = True
+    try:
+        rebuilt = sum(1 for (attr, payload) in jobs if _rebuild_feature(design, attr, payload))
+    finally:
+        _rebuilding = False
+    _log_file(f'OK  WaveBend auto-update: rebuilt {rebuilt}/{len(jobs)} feature(s)')
+
+
+def _trigger_rebuilds():
+    """Execute the hidden command, which performs _pending_rebuilds in-context."""
     try:
         wrap_def = ui.commandDefinitions.itemById(WRAP_CMD_ID)
         if wrap_def:
             wrap_def.execute()                         # (verify: CommandDefinition.execute)
+            return True
     except Exception:
-        futil.log(f'{CMD_NAME}: wrap trigger failed:\n{traceback.format_exc()}')
-
-
-def _wrap_pending(design):
-    """Wrap any tagged Wave Bend cut that has no custom-feature timeline node yet.
-
-    Runs after OUR command terminates: results kept from a preview (isValidResult)
-    could not be wrapped in preview context, so they get their Wave Bend timeline
-    icon here. Also retrofits cuts made by older versions of the add-in."""
-    wrapped = 0
-    comp = design.rootComponent
-    for attr in design.findAttributes(ATTR_GROUP, ATTR_NAME):
-        try:
-            payload = json.loads(attr.value)
-            if payload.get('version') != ATTR_VERSION or payload.get('custom_token'):
-                continue
-            cut = attr.parent
-            if cut is None:
-                continue
-            sketches = design.findEntityByToken(payload.get('sketch_token', ''))
-            sk = sketches[0] if sketches else None
-            name = getattr(cut, 'name', None) or CMD_NAME
-            token = _wrap_custom_feature(comp, sk if sk else cut, cut, name)
-            if token:
-                payload['custom_token'] = token
-                attr.value = json.dumps(payload)       # (verify: Attribute.value settable)
-                wrapped += 1
-        except Exception:
-            continue
-    if wrapped:
-        futil.log(f'{CMD_NAME}: wrapped {wrapped} cut(s) with timeline icon')
+        futil.log(f'{CMD_NAME}: rebuild trigger failed:\n{traceback.format_exc()}')
+    return False
 
 
 def on_command_terminated(args):
-    global _rebuilding
+    global _pending_rebuilds, _rebuilding
     try:
         cmd_id = getattr(args, 'commandId', '') or ''
-        if _rebuilding or cmd_id == WRAP_CMD_ID:
-            return
-        if cmd_id == CMD_ID:
-            # Our own command finished: give kept preview results their timeline icon
-            # (via the hidden command — needs a real execute context).
-            _trigger_wrap()
+        if _rebuilding or cmd_id in (WRAP_CMD_ID, CMD_ID):
             return
         low = cmd_id.lower()
         if not any(h in low for h in _WATCH_HINTS):
@@ -699,14 +714,16 @@ def on_command_terminated(args):
             adsk.core.MessageBoxIconTypes.QuestionIconType)
         if answer != adsk.core.DialogResults.DialogYes:                 # (verify enum)
             return
-        _rebuilding = True
-        try:
-            rebuilt = sum(1 for item in stale if _rebuild_feature(design, *item))
-        finally:
-            _rebuilding = False
-        _log_file(f'OK  WaveBend auto-update: rebuilt {rebuilt}/{n} feature(s)')
-        if rebuilt:
-            _trigger_wrap()   # rebuilt cuts need their timeline icon re-applied too
+        _pending_rebuilds = list(stale)
+        if not _trigger_rebuilds():
+            # hidden command unavailable: rebuild without the icon rather than not at all
+            _pending_rebuilds = []
+            _rebuilding = True
+            try:
+                rebuilt = sum(1 for item in stale if _rebuild_feature(design, *item))
+            finally:
+                _rebuilding = False
+            _log_file(f'OK  WaveBend auto-update: rebuilt {rebuilt}/{n} feature(s), no icons')
     except Exception:
         futil.log(f'WaveBend watcher error:\n{traceback.format_exc()}')
 
