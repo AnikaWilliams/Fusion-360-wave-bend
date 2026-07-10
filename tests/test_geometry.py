@@ -34,72 +34,99 @@ class TestFillet(unittest.TestCase):
         d2 = self._dist_pt_to_line(c, B, G.v_unit(G.v_sub(C, B)))
         self.assertAlmostEqual(d1, 0.1, places=6)
         self.assertAlmostEqual(d2, 0.1, places=6)
-    def test_filleted_square_is_closed(self):
-        verts = [G.Pt(-1, -1), G.Pt(1, -1), G.Pt(1, 1), G.Pt(-1, 1)]
-        segs = G.filleted_polygon(verts, 0.2)
-        self.assertEqual(len(segs), 8)                    # 4 arcs + 4 lines
-        pts = G.sample_profile(segs, n=6)
-        # closed: last sampled point coincides with first
+    def test_fillet_corner_raises_on_collinear(self):
+        # collinear edges would hit tan(0)=0; must raise ValueError, not ZeroDivisionError
+        with self.assertRaises(ValueError):
+            G.fillet_corner(G.Pt(0, 0), G.Pt(1, 0), G.Pt(2, 0), 0.1)
+
+class TestWaveCell(unittest.TestCase):
+    # representative cm inputs: slot=0.65", gap=0.7*0.125", fillet=0.3*gap, diag=0.19"
+    SLOT, GAP, FIL, DIAG = 1.651, 0.2222, 0.0667, 0.4826
+    TH = math.radians(40.0)
+    def test_closed_loop_of_12_segments(self):
+        cell = G.build_wave_cell(self.SLOT, self.GAP, self.FIL)
+        self.assertEqual(len(cell), 12)      # 6 lines + 2 caps + 4 knee fillets
+        pts = G.sample_profile(cell, n=8)
         self.assertAlmostEqual(pts[0].x, pts[-1].x, places=6)
         self.assertAlmostEqual(pts[0].y, pts[-1].y, places=6)
-
-class TestCell(unittest.TestCase):
-    def test_cell_height_equals_gap_and_width_under_slotlen(self):
-        cell = G.build_cell(1.651, 0.1905, 0.05, 40.0)   # cm: 0.65in, 0.075in, ~0.02in
-        pts = G.sample_profile(cell)
-        xmin, ymin, xmax, ymax = G._bbox(pts)
-        self.assertAlmostEqual(ymax - ymin, 0.1905, places=3)        # height == gap
-        self.assertLessEqual(xmax - xmin, 1.651 + 1e-6)              # width <= slot_len
-        self.assertGreater(xmax - xmin, 1.651 - 4 * 0.05)           # not collapsed
-    def test_cell_centered(self):
-        cell = G.build_cell(1.651, 0.1905, 0.05, 40.0, cx=3.0, cy=-2.0)
-        pts = G.sample_profile(cell)
-        xmin, ymin, xmax, ymax = G._bbox(pts)
-        self.assertAlmostEqual((xmin + xmax) / 2, 3.0, places=3)
-        self.assertAlmostEqual((ymin + ymax) / 2, -2.0, places=3)
-    def test_cell_raises_when_too_short(self):
-        with self.assertRaises(ValueError):
-            G.build_cell(0.2, 0.19, 0.2, 40.0)            # fillet bigger than the flat
-    def test_cell_raises_when_fillet_ge_half_gap(self):
-        # fillet == gap/2 collapses the angled ends to zero-length segments
-        with self.assertRaises(ValueError):
-            G.build_cell(1.651, 0.2222, 0.1111, 40.0)     # fillet == gap/2 exactly
-        with self.assertRaises(ValueError):
-            G.build_cell(1.651, 0.2222, 0.15, 40.0)       # fillet > gap/2
-    def test_cell_has_no_degenerate_line_segments(self):
-        # a valid cell (fillet < gap/2) must have only positive-length straight edges
-        cell = G.build_cell(1.651, 0.2222, 0.2222 * 0.3, 40.0)
+    def test_smile_dimensions_match_swept_path(self):
+        cell = G.build_wave_cell(self.SLOT, self.GAP, self.FIL)
+        xmin, ymin, xmax, ymax = G._bbox(G.sample_profile(cell))
+        exp_w = self.SLOT + 2 * self.DIAG * math.cos(self.TH) + self.GAP
+        exp_h = self.DIAG * math.sin(self.TH) + self.GAP
+        self.assertAlmostEqual(xmax - xmin, exp_w, delta=0.02)
+        self.assertAlmostEqual(ymax - ymin, exp_h, delta=0.02)
+        # the horizontal run sits ON the bend line: lower edge exactly at -gap/2
+        self.assertAlmostEqual(ymin, -self.GAP / 2, places=6)
+        # smile: swept ends rise well above the horizontal
+        self.assertGreater(ymax, self.DIAG * math.sin(self.TH) * 0.9)
+    def test_frown_is_exact_mirror_of_smile(self):
+        s = G._bbox(G.sample_profile(G.build_wave_cell(self.SLOT, self.GAP, self.FIL, orient=+1)))
+        f = G._bbox(G.sample_profile(G.build_wave_cell(self.SLOT, self.GAP, self.FIL, orient=-1)))
+        self.assertAlmostEqual(s[3], -f[1], places=6)    # ymax_smile == -ymin_frown
+        self.assertAlmostEqual(s[1], -f[3], places=6)    # ymin_smile == -ymax_frown
+        self.assertAlmostEqual(s[0], f[0], places=6)     # same x extent
+        self.assertAlmostEqual(s[2], f[2], places=6)
+    def test_cell_translated_to_center(self):
+        cell = G.build_wave_cell(self.SLOT, self.GAP, self.FIL, cx=3.0, cy=-2.0)
+        xmin, _, xmax, _ = G._bbox(G.sample_profile(cell))
+        self.assertAlmostEqual((xmin + xmax) / 2, 3.0, delta=0.01)
+    def test_no_degenerate_line_segments(self):
+        cell = G.build_wave_cell(self.SLOT, self.GAP, self.FIL)
         for seg in cell:
             if seg[0] == "line":
                 _, p0, p1 = seg
                 self.assertGreater(G.v_len(G.v_sub(p1, p0)), 1e-4)
+    def test_raises_on_nonpositive_fillet(self):
+        with self.assertRaises(ValueError):
+            G.build_wave_cell(self.SLOT, self.GAP, 0.0)   # sharp corners crack
+    def test_raises_when_fillet_too_large(self):
+        with self.assertRaises(ValueError):
+            G.build_wave_cell(self.SLOT, self.GAP, 5.0)   # no room on any edge
 
 class TestTessellation(unittest.TestCase):
     # representative cm inputs: t=0.3175 (0.125"), gap=0.7t, tab=t, fillet=0.3*gap
-    # (fillet must stay < gap/2 or the cell ends degenerate — see TestCell)
     T = 0.3175
     GAP = 0.3175 * 0.7
     TAB = 0.3175
     FIL = (0.3175 * 0.7) * 0.3
-    def test_solve_pitch_feasible(self):
+    def test_solve_pitch_feasible_and_near_reference(self):
         p = G.solve_pitch(1.651, self.GAP, self.TAB, self.FIL, 40.0)
         self.assertGreater(p, 0.0)
+        # the SendCutSend reference runs ~1.0 in (2.54 cm) per-slot at comparable inputs
+        self.assertLess(abs(p - 2.54), 0.5)
     def test_solve_pitch_large_tab_is_feasible(self):
-        # A large tab just spaces the rows farther apart; it is NOT infeasible. The old
-        # fixed 1.6*slot_len ceiling falsely raised here -- the adaptive ceiling must not.
+        # A large tab just spreads the chain out; it is NOT infeasible.
         p = G.solve_pitch(1.0, 0.1, 0.8, 0.02, 40.0)   # tab = 0.8 * slot_len
         self.assertGreater(p, 0.0)
     def test_solve_pitch_propagates_degenerate_cell(self):
-        # fillet >= gap/2 makes build_cell raise; solve_pitch must surface it, not hang.
+        # nonpositive fillet makes build_wave_cell raise; solve_pitch must surface it.
         with self.assertRaises(ValueError):
-            G.solve_pitch(1.651, self.GAP, self.TAB, self.GAP / 2.0, 40.0)
+            G.solve_pitch(1.651, self.GAP, self.TAB, 0.0, 40.0)
     def test_pattern_honors_no_ligament_below_tab(self):
-        out = G.generate_pattern(10.0, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
+        out = G.generate_pattern(12.0, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
         self.assertGreaterEqual(out["min_ligament"], self.TAB - 1e-3)
-        self.assertAlmostEqual(out["central_tab"], self.TAB, places=4)
         self.assertGreater(out["count"], 1)
+    def test_pattern_alternates_smile_frown(self):
+        out = G.generate_pattern(12.0, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
+        rise = 0.4826 * math.sin(math.radians(40.0)) * 0.5
+        for i, prof in enumerate(out["profiles"]):
+            _, ymin, _, ymax = G._bbox(G.sample_profile(prof, n=6))
+            if i % 2 == 0:
+                self.assertGreater(ymax, rise)     # smile: ends rise
+            else:
+                self.assertLess(ymin, -rise)       # frown: ends fall
+    def test_pattern_is_centered_on_bend_line(self):
+        # horizontal edges of every slot sit ON the line: each profile's near edge at +-gap/2
+        out = G.generate_pattern(12.0, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
+        for i, prof in enumerate(out["profiles"]):
+            _, ymin, _, ymax = G._bbox(G.sample_profile(prof, n=6))
+            if i % 2 == 0:
+                self.assertAlmostEqual(ymin, -self.GAP / 2, places=6)
+            else:
+                self.assertAlmostEqual(ymax, +self.GAP / 2, places=6)
     def test_pattern_within_bend_length(self):
-        B = 8.0
+        B = 10.0
         out = G.generate_pattern(B, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
         for prof in out["profiles"]:
             for p in G.sample_profile(prof):
@@ -115,7 +142,7 @@ class TestTessellation(unittest.TestCase):
         with self.assertRaises(ValueError):
             G.fit_slot_len(10.0, 10000, self.GAP, self.TAB, self.FIL, 40.0, margin=0.0)
     def test_generate_pattern_raises_when_no_cells_fit(self):
-        # bend shorter than one pitch -> zero cells; must raise, not return inf/empty
+        # bend shorter than one slot width -> zero cells; must raise, not return inf/empty
         with self.assertRaises(ValueError):
             G.generate_pattern(0.3, self.GAP, self.TAB, 1.651, self.FIL, 40.0)
 
@@ -133,11 +160,5 @@ class TestDistanceAndFillet(unittest.TestCase):
         self.assertAlmostEqual(G.min_profile_distance([A, B]), 1.0, delta=0.02)
         self.assertAlmostEqual(G.min_profile_distance([A, B]),
                                G.min_profile_distance([B, A]), places=6)  # order-independent
-    def test_filleted_polygon_raises_on_collinear_vertices(self):
-        # collinear consecutive vertices would hit tan(0)=0; must raise ValueError, not ZeroDivisionError
-        verts = [G.Pt(0, 0), G.Pt(1, 0), G.Pt(2, 0), G.Pt(2, 1), G.Pt(0, 1)]
-        with self.assertRaises(ValueError):
-            G.filleted_polygon(verts, 0.1)
-
 if __name__ == "__main__":
     unittest.main()

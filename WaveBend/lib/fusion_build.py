@@ -48,9 +48,21 @@ _MIN_SEG_CM = 1e-4   # skip sketch lines shorter than this (defensive against de
 
 
 def draw_pattern_sketch(comp, pattern, frame):
-    """Draw every cell profile into ONE new sketch on the frame's face. Returns the sketch."""
+    """Draw every cell profile into ONE new sketch on the frame's face. Returns the sketch.
+
+    IMPORTANT: Fusion sketch entities live in the SKETCH's local coordinate system,
+    not model space -- a face sketch has its own origin/axes (and often a flipped
+    axis). Drawing raw model-space coordinates misplaces the pattern relative to the
+    selected bend line. Every point is therefore mapped model->sketch via
+    Sketch.modelToSketchSpace().
+    """
     origin, u_hat, v_hat, _length, face = frame
     sk = comp.sketches.add(face)                       # (verify: sketches.add(planarFace))
+
+    def sp(u, v):
+        # local (u,v) -> model Point3D -> THIS sketch's coordinates (verify: modelToSketchSpace)
+        return sk.modelToSketchSpace(_pt3d(origin, u_hat, v_hat, u, v))
+
     lines = sk.sketchCurves.sketchLines
     arcs = sk.sketchCurves.sketchArcs
     for profile in pattern["profiles"]:
@@ -59,16 +71,13 @@ def draw_pattern_sketch(comp, pattern, frame):
                 _, a, b = seg
                 if math.hypot(b.x - a.x, b.y - a.y) < _MIN_SEG_CM:
                     continue                           # adjacent arcs already meet; skip the stub
-                lines.addByTwoPoints(_pt3d(origin, u_hat, v_hat, a.x, a.y),
-                                     _pt3d(origin, u_hat, v_hat, b.x, b.y))
+                lines.addByTwoPoints(sp(a.x, a.y), sp(b.x, b.y))
             else:
                 _, c, r, a0, a1, a, b = seg
                 am = (a0 + a1) / 2.0
                 mid = G.Pt(c.x + r * math.cos(am), c.y + r * math.sin(am))
                 arcs.addByThreePoints(                 # (verify: addByThreePoints)
-                    _pt3d(origin, u_hat, v_hat, a.x, a.y),
-                    _pt3d(origin, u_hat, v_hat, mid.x, mid.y),
-                    _pt3d(origin, u_hat, v_hat, b.x, b.y))
+                    sp(a.x, a.y), sp(mid.x, mid.y), sp(b.x, b.y))
     return sk
 
 

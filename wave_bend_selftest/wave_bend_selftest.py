@@ -1,12 +1,10 @@
 # wave_bend_selftest/wave_bend_selftest.py  -- run via Scripts and Add-Ins
 #
 # Self-contained, NON-interactive verification of the Stage 1a Fusion layer.
-# Builds a test plate, picks a long top edge programmatically, runs the production
-# pipeline (local_frame -> generate_pattern -> draw_and_cut) plus the body readers,
-# and writes the result/traceback to <repo>/last_run.log.
-#
-# Lives in a Fusion-conventional folder (folder name == script name) and locates
-# the repo root by walking up to the folder that contains "WaveBend".
+# Builds a test plate, draws an interior bend line, then exercises the PRODUCTION
+# data path: measure thickness + read material from the body -> derive gap/tab/
+# fillet -> generate the wave chain -> sketch (model->sketch space) -> one cut.
+# Writes the result/traceback to <repo>/last_run.log.
 import os, sys, traceback
 import adsk.core, adsk.fusion
 
@@ -28,6 +26,7 @@ def _find_repo(start):
 REPO = _find_repo(HERE)
 sys.path.insert(0, os.path.join(REPO, "WaveBend"))
 sys.path.insert(0, os.path.join(REPO, "WaveBend", "lib"))
+import config
 import geometry as G
 import fusion_build as FB
 
@@ -43,16 +42,11 @@ def _log(msg):
     print(msg)
 
 
-# Stage 1a inputs (cm): 0.125 in plate, 0.7 gap, ~0.65 in slot.
-THICKNESS_CM = 0.3175
-GAP_CM       = THICKNESS_CM * 0.7
-TAB_CM       = THICKNESS_CM
-SLOT_LEN_CM  = 1.651
-FILLET_CM    = GAP_CM * 0.3   # must be < gap/2 or the angled cell ends collapse
+PLATE_T_CM = 0.3175   # the test plate we build (0.125 in)
 
 
 def _build_plate(root):
-    """Create a 10 x 6 x 0.3175 cm flat plate; return its BRepBody."""
+    """Create a 10 x 6 x PLATE_T_CM flat plate; return its BRepBody."""
     sk = root.sketches.add(root.xYConstructionPlane)
     sk.sketchCurves.sketchLines.addTwoPointRectangle(
         adsk.core.Point3D.create(0, 0, 0),
@@ -60,7 +54,7 @@ def _build_plate(root):
     prof = sk.profiles.item(0)
     ext = root.features.extrudeFeatures
     ein = ext.createInput(prof, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
-    ein.setDistanceExtent(False, adsk.core.ValueInput.createByReal(THICKNESS_CM))
+    ein.setDistanceExtent(False, adsk.core.ValueInput.createByReal(PLATE_T_CM))
     plate = ext.add(ein)
     return plate.bodies.item(0)
 
@@ -82,8 +76,9 @@ def run(context):
     diag = "n/a"
     try:
         # Fusion caches imported modules across runs in one session; force-reload so
-        # edits to geometry.py / fusion_build.py take effect without restarting Fusion.
+        # library edits take effect without restarting Fusion.
         import importlib
+        importlib.reload(config)
         importlib.reload(G)
         importlib.reload(FB)
 
@@ -98,35 +93,56 @@ def run(context):
         if top is None:
             raise RuntimeError("could not find the top face of the plate")
         # Interior bend line: a centerline drawn ON the top face, inset from the
-        # plate ends, so the straddling wave pattern stays inside the body.
-        z = top.boundingBox.minPoint.z                 # top-face plane height (== thickness)
+        # plate ends, so the wave chain stays inside the body.
+        z = top.boundingBox.minPoint.z
         bsk = root.sketches.add(top)
+        p0 = adsk.core.Point3D.create(1.0, 3.0, z)
+        p1 = adsk.core.Point3D.create(9.0, 3.0, z)
         bend = bsk.sketchCurves.sketchLines.addByTwoPoints(
-            adsk.core.Point3D.create(1.0, 3.0, z),
-            adsk.core.Point3D.create(9.0, 3.0, z))
-        edge_len = 8.0                                  # 9 - 1, the bend-line length in cm
+            bsk.modelToSketchSpace(p0), bsk.modelToSketchSpace(p1))
+        edge_len = 8.0
 
         frame = FB.local_frame(bend)
-        pattern = G.generate_pattern(frame[3], GAP_CM, TAB_CM, SLOT_LEN_CM, FILLET_CM, 40.0)
 
-        # Pure-geometry diagnostics (cannot fail) so even a Fusion error tells me the shape:
+        # PRODUCTION data path: measure the body, derive the numbers.
+        t = FB.measure_thickness_cm(top)
+        if not t or t <= 0:
+            t = PLATE_T_CM
+        mat = FB.read_material_name(top)
+        m = config.gap_multiplier_for(mat)
+        gap = config.default_gap_cm(t, mat)
+        tab = config.default_tab_cm(t)
+        fil = config.default_fillet_cm(gap)
+
+        pattern = G.generate_pattern(frame[3], gap, tab,
+                                     config.DEFAULT_SLOT_LEN_CM, fil,
+                                     config.DEFAULT_END_ANGLE_DEG,
+                                     diag_len=config.DEFAULT_DIAG_LEN_CM)
+
+        # Pure-geometry diagnostics (cannot fail) so even a Fusion error tells the shape:
         ncells = len(pattern["profiles"])
         c0 = G.sample_profile(pattern["profiles"][0])
         cw = max(p.x for p in c0) - min(p.x for p in c0)
         ch = max(p.y for p in c0) - min(p.y for p in c0)
-        diag = "cells={} cell0={:.3f}x{:.3f}cm pitch={:.3f} min_lig={:.3f}".format(
-            ncells, cw, ch, pattern['pitch'], pattern['min_ligament'])
+        diag = ("t={:.4f} mat='{}' m={} gap={:.4f} | slots={} cell0={:.3f}x{:.3f}cm "
+                "pitch={:.3f} min_lig={:.3f} (tab {:.4f})").format(
+                    t, mat, m, gap, ncells, cw, ch,
+                    pattern['pitch'], pattern['min_ligament'], tab)
 
-        # Draw, inspect the sketch (1 closed profile per cell == healthy), then cut.
+        # Draw, inspect the sketch (1 closed profile per slot == healthy), then cut.
         sk = FB.draw_pattern_sketch(root, pattern, frame)
         diag += " sketch_profiles={}".format(sk.profiles.count)
-        FB.cut_sketch(root, sk, THICKNESS_CM)
+        # Alignment probe: the first drawn entity, mapped back to model space, must sit
+        # on the bend line (y ~ 3.0, z ~ plate top). (verify: SketchCurve.worldGeometry)
+        try:
+            wg = sk.sketchCurves.sketchLines.item(0).worldGeometry
+            diag += " probe_model=({:.3f},{:.3f},{:.3f})".format(
+                wg.startPoint.x, wg.startPoint.y, wg.startPoint.z)
+        except Exception:
+            diag += " probe_model=unavailable"
+        FB.cut_sketch(root, sk, t)
 
-        t_meas = FB.measure_thickness_cm(top)
-        mat = FB.read_material_name(top)
-
-        _log("OK  selftest: bend L={:.3f}cm; {}; measured t={:.4f}cm; material='{}'".format(
-            edge_len, diag, t_meas, mat))
+        _log("OK  selftest: bend L={:.3f}cm; {}".format(edge_len, diag))
         ui.messageBox("Wave-bend SELFTEST done. See last_run.log")
     except Exception:
         _log("FAIL selftest [{}]:\n{}".format(diag, traceback.format_exc()))

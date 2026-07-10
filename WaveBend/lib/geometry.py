@@ -81,7 +81,11 @@ def min_profile_distance(profiles, n=12):
     return best
 
 def fillet_corner(A, B, C, R):
-    """Tangent fillet of radius R at vertex B (edges B->A and B->C). Convex corners."""
+    """Tangent fillet of radius R at vertex B (edges B->A and B->C).
+
+    Works for convex corners and for concave 'knee' corners of a closed outline --
+    the construction (tangent circle on the bisector side) is the same; only the
+    arc's curvature relative to the loop differs."""
     v1 = v_unit(v_sub(A, B)); v2 = v_unit(v_sub(C, B))
     cosang = max(-1.0, min(1.0, v1.x * v2.x + v1.y * v2.y))
     phi = math.acos(cosang)                      # interior angle at B
@@ -100,97 +104,145 @@ def fillet_corner(A, B, C, R):
     while da > math.pi:  da -= 2 * math.pi
     return T1, T2, center, a0, a0 + da, tan_len
 
-def filleted_polygon(verts, R):
-    """Closed profile: for each vertex emit its arc (T1->T2) then a line to the
-    next vertex's entry tangent point. Returns [arc, line, arc, line, ...]."""
-    n = len(verts)
-    f = [fillet_corner(verts[(i - 1) % n], verts[i], verts[(i + 1) % n], R)
-         for i in range(n)]
-    segs = []
-    for i in range(n):
-        T1, T2, c, a0, a1, _ = f[i]
-        segs.append(("arc", c, R, a0, a1, T1, T2))
-        next_T1 = f[(i + 1) % n][0]
-        segs.append(("line", T2, next_T1))
-    return segs
+def _line_intersect(p, d, q, e):
+    """Intersection of the infinite lines p + t*d and q + s*e. Raises on parallel."""
+    det = d.x * e.y - d.y * e.x
+    if abs(det) < 1e-12:
+        raise ValueError("parallel lines cannot form a knee corner")
+    t = ((q.x - p.x) * e.y - (q.y - p.y) * e.x) / det
+    return Pt(p.x + t * d.x, p.y + t * d.y)
 
-def build_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, cx=0.0, cy=0.0):
-    """Filleted angled-end hexagon cell centered at (cx, cy), long axis along x."""
-    th = math.radians(end_angle_deg)
-    # The angled-end straight segment has length proportional to (gap/2 - fillet_r)
-    # for ANY end angle, so fillet_r == gap/2 collapses the ends to zero-length
-    # segments and fillet_r > gap/2 makes them self-intersect. Reject both.
-    if fillet_r >= gap / 2.0:
-        raise ValueError(
-            f"fillet_r={fillet_r:.4f} must be < gap/2={gap / 2.0:.4f} (cell ends degenerate)")
-    ext = (gap / 2.0) / math.tan(th)          # how far each pointed end extends past the flats
-    a = slot_len / 2.0 - ext                   # half-length of the flat top/bottom edges
-    if a <= fillet_r * 1.05:
-        raise ValueError(
-            f"slot_len={slot_len:.4f} too short for fillet_r={fillet_r:.4f} at {end_angle_deg} deg")
-    h = gap / 2.0
-    verts = [
-        Pt(cx - a, cy + h),        # top-left
-        Pt(cx + a, cy + h),        # top-right
-        Pt(cx + slot_len / 2.0, cy),  # right point
-        Pt(cx + a, cy - h),        # bottom-right
-        Pt(cx - a, cy - h),        # bottom-left
-        Pt(cx - slot_len / 2.0, cy),  # left point
-    ]
-    return filleted_polygon(verts, fillet_r)
+def build_wave_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, diag_len=0.4826,
+                    orient=+1, cx=0.0, cy=0.0):
+    """One wave slot: a constant-width SMILE (orient=+1) or FROWN (orient=-1).
 
+    The cut is a swept path -- diagonal end, horizontal (length slot_len), diagonal
+    end, both ends sweeping to the SAME side -- of width `gap`, with semicircular
+    caps (r = gap/2) at the free ends, inner knee fillets of radius `fillet_r`, and
+    outer knee fillets of radius `fillet_r + gap` (constant width preserved).
 
-# ---------------------------------------------------------------------------
-# Tessellation helpers
-# ---------------------------------------------------------------------------
-
-def _row_offset(gap, tab):
-    """v-distance of each row center from the bend line so the central tab == tab."""
-    return (tab + gap) / 2.0
-
-
-def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th):
-    """Build a small 2-row x 3-col patch at this pitch and measure the tightest gap.
-
-    Uses coarse sampling (n=6): the BINDING ligaments here are between parallel straight
-    edges (the diagonal gaps and the central tab), whose point-to-segment distance is
-    exact at any sampling density, so the feasibility decision is unaffected -- only the
-    far, non-binding vertex-to-edge approaches lose precision. This keeps solve_pitch's
-    repeated scans cheap. generate_pattern still reports min_ligament at full density.
+    Matches the SendCutSend reference DXF: horizontal ~0.65 in, diagonals ~0.19 in
+    at ~40 deg; only the gap scales with material thickness. The horizontal edge of
+    the slot sits ON the bend line (cy); the swept ends rise (smile) or fall (frown).
+    Returns a closed list of ("line", ...) / ("arc", ...) segments.
     """
-    d = _row_offset(gap, tab)
-    cells = []
-    for v, off in ((+d, 0.0), (-d, pitch / 2.0)):
-        for i in range(3):
-            cells.append(build_cell(slot_len, gap, fillet_r, th, off + i * pitch, v))
+    if gap <= 0 or slot_len <= 0 or diag_len <= 0:
+        raise ValueError("gap, slot_len and diag_len must all be positive")
+    if fillet_r <= 0:
+        raise ValueError("fillet_r must be > 0 (sharp internal corners crack when bent)")
+    th = math.radians(end_angle_deg)
+    if not (math.radians(5.0) < th < math.radians(85.0)):
+        raise ValueError("end_angle_deg out of range (5..85)")
+    g2 = gap / 2.0
+    h2 = slot_len / 2.0
+    # Path vertices for a smile (ends up), before orient/translate:
+    B = Pt(-h2, 0.0); C = Pt(+h2, 0.0)
+    d1 = Pt(math.cos(th), -math.sin(th))     # direction A -> B (down-right)
+    d2 = Pt(1.0, 0.0)                        # direction B -> C
+    d3 = Pt(math.cos(th), +math.sin(th))     # direction C -> D (up-right)
+    A = Pt(B.x - diag_len * d1.x, B.y - diag_len * d1.y)   # raised left end
+    D = Pt(C.x + diag_len * d3.x, C.y + diag_len * d3.y)   # raised right end
+    n1 = Pt(math.sin(th), math.cos(th))      # left normal of d1
+    n3 = Pt(-math.sin(th), math.cos(th))     # left normal of d3
+    # Boundary anchors: ends offset +-gap/2 across the path; knees by line intersection.
+    Au = Pt(A.x + n1.x * g2, A.y + n1.y * g2); La = Pt(A.x - n1.x * g2, A.y - n1.y * g2)
+    Du = Pt(D.x + n3.x * g2, D.y + n3.y * g2); Da = Pt(D.x - n3.x * g2, D.y - n3.y * g2)
+    Bu = _line_intersect(Au, d1, Pt(B.x, B.y + g2), d2)
+    Bl = _line_intersect(La, d1, Pt(B.x, B.y - g2), d2)
+    Cu = _line_intersect(Du, d3, Pt(C.x, C.y + g2), d2)
+    Cl = _line_intersect(Da, d3, Pt(C.x, C.y - g2), d2)
+    r_in, r_out = fillet_r, fillet_r + gap
+    fBl = fillet_corner(La, Bl, Cl, r_out)   # outer knees (below the path on a smile)
+    fCl = fillet_corner(Bl, Cl, Da, r_out)
+    fCu = fillet_corner(Du, Cu, Bu, r_in)    # inner knees
+    fBu = fillet_corner(Cu, Bu, Au, r_in)
+    # Feasibility: tangent points must stay on their edges.
+    def _d(p, q): return math.hypot(q.x - p.x, q.y - p.y)
+    if fBl[5] + fCl[5] > _d(Bl, Cl) - 1e-9 or fBu[5] + fCu[5] > _d(Bu, Cu) - 1e-9:
+        raise ValueError("fillet_r too large for slot_len (knee fillets overlap)")
+    if (fBl[5] > _d(Bl, La) - 1e-9 or fBu[5] > _d(Bu, Au) - 1e-9 or
+            fCl[5] > _d(Cl, Da) - 1e-9 or fCu[5] > _d(Cu, Du) - 1e-9):
+        raise ValueError("fillet_r or gap too large for diag_len (no room on the diagonal)")
+
+    def cap(center, from_pt):
+        # 180-degree end cap, CCW from from_pt; midpoint bulges away from the slot.
+        a0 = math.atan2(from_pt.y - center.y, from_pt.x - center.x)
+        a1 = a0 + math.pi
+        to_pt = Pt(center.x + g2 * math.cos(a1), center.y + g2 * math.sin(a1))
+        return ("arc", center, g2, a0, a1, from_pt, to_pt), to_pt
+
+    segs = [("line", La, fBl[0]),
+            ("arc", fBl[2], r_out, fBl[3], fBl[4], fBl[0], fBl[1]),
+            ("line", fBl[1], fCl[0]),
+            ("arc", fCl[2], r_out, fCl[3], fCl[4], fCl[0], fCl[1]),
+            ("line", fCl[1], Da)]
+    cap_r, du = cap(D, Da)
+    segs.append(cap_r)
+    segs += [("line", du, fCu[0]),
+             ("arc", fCu[2], r_in, fCu[3], fCu[4], fCu[0], fCu[1]),
+             ("line", fCu[1], fBu[0]),
+             ("arc", fBu[2], r_in, fBu[3], fBu[4], fBu[0], fBu[1]),
+             ("line", fBu[1], Au)]
+    cap_l, _ = cap(A, Au)
+    segs.append(cap_l)
+    # Orient (mirror v for a frown) and translate to (cx, cy).
+    s = 1.0 if orient >= 0 else -1.0
+    out = []
+    for seg in segs:
+        if seg[0] == "line":
+            _, p0, p1 = seg
+            out.append(("line", Pt(cx + p0.x, cy + s * p0.y), Pt(cx + p1.x, cy + s * p1.y)))
+        else:
+            _, c, r, a0, a1, p0, p1 = seg
+            out.append(("arc", Pt(cx + c.x, cy + s * c.y), r,
+                        a0 if s > 0 else -a0, a1 if s > 0 else -a1,
+                        Pt(cx + p0.x, cy + s * p0.y), Pt(cx + p1.x, cy + s * p1.y)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tessellation: a single wave chain along the bend line
+# ---------------------------------------------------------------------------
+
+def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th, diag_len):
+    """Four alternating smile/frown slots at this per-slot pitch; tightest gap.
+
+    Covers both junction types (smile->frown, frown->smile) and the same-orientation
+    second-neighbour clearance. Coarse sampling (n=6) is safe: the binding ligaments
+    are between parallel straight edges (the paired end diagonals, and same-level
+    horizontals), where point-to-segment distance is exact at any density.
+    """
+    cells = [build_wave_cell(slot_len, gap, fillet_r, th, diag_len,
+                             orient=+1 if i % 2 == 0 else -1, cx=i * pitch, cy=0.0)
+             for i in range(4)]
     return min_profile_distance(cells, n=6)
 
 
-def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48):
-    """Smallest same-row pitch whose every ligament is >= tab (densest valid pattern).
+def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48,
+                diag_len=0.4826):
+    """Smallest per-slot pitch whose every ligament is >= tab (densest valid chain).
 
-    Feasibility is monotone: above some boundary pitch the pattern is always valid (the
-    central tab is exactly `tab` by construction and the diagonal ligaments only widen),
-    so a feasible pitch essentially always exists for positive inputs. The search window
-    GROWS until a feasible pitch is found rather than assuming a fixed ceiling -- a fixed
-    1.6*slot_len ceiling falsely reported 'infeasible' when the boundary sat above it.
-    Raises ValueError only past a hard cap (e.g. degenerate cell geometry).
+    Feasibility is monotone in pitch (spreading slots apart only widens every
+    ligament), so the search window GROWS until a feasible pitch is found.
+    Raises ValueError only past a hard cap (degenerate cell geometry).
     """
     th = end_angle_deg
-    ext = (gap / 2.0) / math.tan(math.radians(th))
-    lo = 2.0 * ext + 0.05 * slot_len     # below this, pointed ends collide
-    hi = max(1.6 * slot_len, slot_len + 4.0 * (tab + gap))
+    sin_th = math.sin(math.radians(th))
+    # Below roughly (tab+gap)/sin(th) the diagonal ligament cannot reach `tab`.
+    lo = 0.7 * (tab + gap) / sin_th
+    hi = max(2.0 * slot_len, (tab + gap) / sin_th * 2.0)
     cap = 64.0 * (slot_len + tab + gap)  # backstop against an unbounded loop
     while True:
         step = (hi - lo) / samples
         feasible = []
         p = lo
         while p <= hi + 1e-12:
-            if _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th) >= tab - 1e-6:
+            if _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th,
+                                       diag_len) >= tab - 1e-6:
                 feasible.append(p)
             p += step
         if feasible:
-            return min(feasible)         # smallest feasible pitch = densest pattern
+            return min(feasible)         # smallest feasible pitch = densest chain
         if hi >= cap:
             raise ValueError(
                 "no feasible pitch found below cap (degenerate cell geometry?)")
@@ -204,7 +256,8 @@ def fit_count(bend_len, pitch, margin):
     return max(1, int(usable // pitch) + 1)
 
 
-def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
+def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin,
+                 diag_len=0.4826):
     """Invert fit_count: pick the slot_len whose solved pitch yields ~`count` cells.
 
     Raises ValueError when `count` cannot fit in `bend_len` -- i.e. the requested count
@@ -218,7 +271,7 @@ def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
     for _ in range(40):
         mid = (lo + hi) / 2.0
         try:
-            p = solve_pitch(mid, gap, tab, fillet_r, end_angle_deg)
+            p = solve_pitch(mid, gap, tab, fillet_r, end_angle_deg, diag_len=diag_len)
         except ValueError:
             lo = mid; continue
         if p < target_pitch:
@@ -228,7 +281,7 @@ def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
     result = (lo + hi) / 2.0
     # Verify the requested count actually fits at the resulting slot length.
     try:
-        p = solve_pitch(result, gap, tab, fillet_r, end_angle_deg)
+        p = solve_pitch(result, gap, tab, fillet_r, end_angle_deg, diag_len=diag_len)
     except ValueError:
         raise ValueError(f"cannot fit {count} slots in bend_len={bend_len:.4f} "
                          f"(implied slot too short to form a cell)")
@@ -239,46 +292,45 @@ def fit_slot_len(bend_len, count, gap, tab, fillet_r, end_angle_deg, margin):
     return result
 
 
-def generate_pattern(bend_len, gap, tab, slot_len, fillet_r, end_angle_deg=40.0):
-    """Tessellate cells along a bend in two brick-staggered rows.
+def generate_pattern(bend_len, gap, tab, slot_len, fillet_r, end_angle_deg=40.0,
+                     diag_len=0.4826):
+    """A single wave chain along the bend line: slots alternate smile / frown.
 
-    Args: bend_len (float) - total bend length to tessellate
-          gap, tab, slot_len, fillet_r, end_angle_deg - cell geometry params
+    The slots' horizontal edges sit ON the bend line (v=0), so the pattern is centered
+    on the user's selected line by construction. Consecutive slots' swept ends form
+    parallel diagonal pairs; the material strip between each pair is the "angled tab".
+    The per-slot pitch is solved so NO ligament is narrower than `tab`.
 
     Returns dict with keys:
-      - profiles: list of build_cell profiles (filleted polygons)
-      - count: cells in the UPPER row (representative 'cells per row'; lower row may
-               differ by ±1 due to brick offset)
-      - pitch: solved pitch (x-spacing between cells within a row)
-      - row_offset: y-distance from bend center to each row
-      - central_tab: clearance between rows == tab (by construction)
-      - min_ligament: narrowest gap between any two placed cells
-
-    Note: len(result["profiles"]) is TOTAL cells placed; count is upper-row count.
+      - profiles: list of build_wave_cell outlines (closed loops), left to right
+      - count: total slots in the chain
+      - pitch: solved per-slot x-advance
+      - row_offset: 0.0 (kept for API stability; single-chain layout has no rows)
+      - central_tab: the tab target the pitch was solved for (== tab)
+      - min_ligament: narrowest measured gap between any two placed slots
     """
     th = end_angle_deg
-    d = _row_offset(gap, tab)
-    pitch = solve_pitch(slot_len, gap, tab, fillet_r, th)
-    margin = pitch / 2.0                              # solid end margins, half a pitch
+    pitch = solve_pitch(slot_len, gap, tab, fillet_r, th, diag_len=diag_len)
+    # Solid end margins: the end slots must sit fully inside the bend span.
+    probe = sample_profile(build_wave_cell(slot_len, gap, fillet_r, th, diag_len), n=4)
+    half_w = (max(p.x for p in probe) - min(p.x for p in probe)) / 2.0
+    margin = half_w + gap
     count = fit_count(bend_len, pitch, margin)
     if count == 0:
         raise ValueError(
-            f"no cells fit: bend_len={bend_len:.4f} too short for pitch={pitch:.4f} "
-            f"(slot_len={slot_len:.4f}); use a longer bend line or shorter slots")
+            f"no slots fit: bend_len={bend_len:.4f} too short for slot width "
+            f"{2 * half_w:.4f} plus margins; use a longer bend line or shorter slots")
     span = (count - 1) * pitch
-    start = (bend_len - span) / 2.0                   # center the band
-    profiles = []
-    for v, row_off in ((+d, 0.0), (-d, pitch / 2.0)):
-        u = start + row_off
-        while u <= bend_len - margin + 1e-9:
-            if u >= margin - 1e-9:
-                profiles.append(build_cell(slot_len, gap, fillet_r, th, u, v))
-            u += pitch
+    start = (bend_len - span) / 2.0                   # center the chain
+    profiles = [build_wave_cell(slot_len, gap, fillet_r, th, diag_len,
+                                orient=+1 if i % 2 == 0 else -1,
+                                cx=start + i * pitch, cy=0.0)
+                for i in range(count)]
     return {
         "profiles": profiles,
         "count": count,
         "pitch": pitch,
-        "row_offset": d,
-        "central_tab": 2.0 * d - gap,                 # == tab by construction
-        "min_ligament": min_profile_distance(profiles) if len(profiles) > 1 else float("inf"),
+        "row_offset": 0.0,
+        "central_tab": tab,
+        "min_ligament": min_profile_distance(profiles) if count > 1 else float("inf"),
     }

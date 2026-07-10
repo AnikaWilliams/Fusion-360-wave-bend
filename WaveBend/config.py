@@ -1,7 +1,8 @@
 """Defaults and material->gap-multiplier table. Pure; no adsk imports."""
 
 DEFAULT_END_ANGLE_DEG = 40.0
-DEFAULT_SLOT_LEN_CM = 1.651   # ~0.65 in, constant SendCutSend cell length (from DXF)
+DEFAULT_SLOT_LEN_CM = 1.651   # ~0.65 in: the slot's HORIZONTAL run, constant across gauges (DXF)
+DEFAULT_DIAG_LEN_CM = 0.4826  # ~0.19 in: swept diagonal end length, constant across gauges (DXF)
 
 # substring (lowercased) -> gap multiplier m
 MATERIAL_MULTIPLIERS = {
