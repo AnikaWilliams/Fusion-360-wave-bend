@@ -42,8 +42,14 @@ _suppress = False
 # Cached linear pitch model: solve_pitch is too slow to run per dialog edit, but for
 # fixed (gap, tab, fillet, angle, diag) the solved pitch tracks slot_len almost
 # exactly as  pitch = slot_len + C.  We solve C once per parameter combination and
-# do the interlink algebraically; execute() always uses the real solver.
+# do the interlink algebraically; the preview/execute path uses the real solver.
 _pitch_model = {'key': None, 'C': None}
+
+# Cached solved pattern for the preview/execute path. executePreview fires on every
+# input change and the exact solver costs ~1s, so only genuinely NEW parameter
+# combinations pay for a solve — repeat previews and the final OK are instant.
+# (The pattern depends only on these numbers, not on the line's position/orientation.)
+_pattern_cache = {'key': None, 'pattern': None}
 
 _MATERIAL_ITEMS = ('Aluminum', 'Mild Steel', 'Stainless Steel', 'Titanium')
 
@@ -100,6 +106,52 @@ def _bend_len(inputs):
         return 0.0
 
 
+def _set_status(inputs, text):
+    box = inputs.itemById('status')
+    if box:
+        box.text = text
+
+
+def _get_pattern(bend_len, gap, tab, fil, slot):
+    """Exact-solver pattern, cached per parameter combination (see _pattern_cache)."""
+    key = tuple(round(v, 6) for v in (bend_len, gap, tab, fil, slot))
+    if _pattern_cache['key'] != key:
+        _pattern_cache['pattern'] = G.generate_pattern(
+            bend_len, gap, tab, slot, fil,
+            config.DEFAULT_END_ANGLE_DEG, diag_len=config.DEFAULT_DIAG_LEN_CM)
+        _pattern_cache['key'] = key
+    return _pattern_cache['pattern']
+
+
+def _build(inputs):
+    """Shared by preview and execute: solve the pattern and cut it. Returns (pattern, t).
+
+    Raises ValueError with a plain-language message when the combination is infeasible.
+    """
+    entity = inputs.itemById('bendLine').selection(0).entity
+    t = inputs.itemById('thickness').value
+    gap = inputs.itemById('gap').value
+    tab = inputs.itemById('tab').value
+    fil = inputs.itemById('fillet').value
+    slot = inputs.itemById('slotLen').value
+    frame = FB.local_frame(entity)
+    pattern = _get_pattern(frame[3], gap, tab, fil, slot)
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    FB.draw_and_cut(design.rootComponent, pattern, frame, t)
+    return pattern, t
+
+
+def _status_summary(inputs, pattern):
+    """Human-readable status + Phase-2 validation warnings (dialog units are mm)."""
+    t = inputs.itemById('thickness').value
+    tab = inputs.itemById('tab').value
+    msg = 'OK: {} slots, pitch {:.1f} mm, min ligament {:.2f} mm'.format(
+        pattern['count'], pattern['pitch'] * 10.0, pattern['min_ligament'] * 10.0)
+    if tab < t - 1e-9:
+        msg += '\nWarning: tab < thickness — the fold ligaments will be weak (rule: tab >= t)'
+    return msg
+
+
 def start():
     cmd_def = ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER)
     futil.add_handler(cmd_def.commandCreated, command_created)
@@ -147,8 +199,12 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs.addValueInput('slotLen', 'Slot length', 'cm',
                          adsk.core.ValueInput.createByReal(config.DEFAULT_SLOT_LEN_CM))
     inputs.addIntegerSpinnerCommandInput('slotCount', 'Slot count', 1, 999, 1, 6)
+    status = inputs.addTextBoxCommandInput(
+        'status', 'Status', 'Select a bend line to preview the pattern.', 3, True)
+    status.isFullWidth = True                          # (verify: TextBoxCommandInput.isFullWidth)
 
     futil.add_handler(args.command.execute, command_execute, local_handlers=local_handlers)
+    futil.add_handler(args.command.executePreview, command_preview, local_handlers=local_handlers)
     futil.add_handler(args.command.inputChanged, command_input_changed, local_handlers=local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
@@ -268,28 +324,36 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     args.areInputsValid = ok
 
 
+def command_preview(args: adsk.core.CommandEventArgs):
+    """Live preview: build the REAL pattern + cut; Fusion auto-rolls it back on the
+    next input change. isValidResult=True makes OK simply keep the last preview."""
+    inputs = args.command.commandInputs
+    if inputs.itemById('bendLine').selectionCount == 0:
+        return
+    try:
+        pattern, t = _build(inputs)
+        args.isValidResult = True                      # OK reuses this result instantly
+        _set_status(inputs, _status_summary(inputs, pattern))
+        _log_file('PREVIEW-OK  WaveBend: {} slots, pitch {:.3f} cm, min ligament {:.3f} cm; '
+                  't={:.4f}'.format(pattern['count'], pattern['pitch'],
+                                    pattern['min_ligament'], t))
+    except ValueError as e:
+        _set_status(inputs, f'Cannot build pattern: {e}')
+        futil.log(f'{CMD_NAME} preview infeasible: {e}')
+    except Exception:
+        _set_status(inputs, 'Preview failed — see Text Commands for details.')
+        futil.log(f'{CMD_NAME} preview error:\n{traceback.format_exc()}')
+
+
 def command_execute(args: adsk.core.CommandEventArgs):
+    """Fallback path: only runs if the last preview was not marked valid."""
     futil.log(f'{CMD_NAME} Command Execute Event')
     try:
         inputs = args.command.commandInputs
-        entity = inputs.itemById('bendLine').selection(0).entity
-        t = inputs.itemById('thickness').value
-        gap = inputs.itemById('gap').value
-        tab = inputs.itemById('tab').value
-        fil = inputs.itemById('fillet').value
-        slot = inputs.itemById('slotLen').value
-
-        frame = FB.local_frame(entity)
-        design = adsk.fusion.Design.cast(app.activeProduct)
-        comp = design.rootComponent
-        pattern = G.generate_pattern(frame[3], gap, tab, slot, fil,
-                                     config.DEFAULT_END_ANGLE_DEG,
-                                     diag_len=config.DEFAULT_DIAG_LEN_CM)
-        FB.draw_and_cut(comp, pattern, frame, t)
-        _log_file('OK  WaveBend add-in: {} slots, pitch {:.3f} cm, min ligament {:.3f} cm '
-                  '(tab {:.3f}); t={:.4f} gap={:.4f}'.format(
-                      pattern['count'], pattern['pitch'], pattern['min_ligament'],
-                      tab, t, gap))
+        pattern, t = _build(inputs)
+        _log_file('OK  WaveBend add-in: {} slots, pitch {:.3f} cm, min ligament {:.3f} cm; '
+                  't={:.4f}'.format(pattern['count'], pattern['pitch'],
+                                    pattern['min_ligament'], t))
     except Exception:
         _log_file('FAIL WaveBend add-in execute:\n' + traceback.format_exc())
         ui.messageBox('Wave Bend failed — see last_run.log / Text Commands for details.')
