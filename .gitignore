@@ -16,3 +16,6 @@ Desktop.ini
 # Logs / scratch
 *.log
 last_run.log
+
+# Fusion-generated VS Code debug configs
+.vscode/

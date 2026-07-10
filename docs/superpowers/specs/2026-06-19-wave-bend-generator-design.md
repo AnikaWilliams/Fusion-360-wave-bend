@@ -3,6 +3,18 @@
 **Date:** 2026-06-19
 **Status:** Design approved (Approach A + fillet-radius input); pending spec review.
 
+> **REV A (2026-06-19, approved): cell shape corrected to the true wave.**
+> A full closed-loop re-analysis of the reference DXF (`tools/wave_path_analysis.py`,
+> 95 slot outlines) showed every slot is a constant-width **SMILE/FROWN wave** — a
+> swept path (diagonal ≈0.19″ @ ~40° · horizontal ≈0.65″ · diagonal, both ends the
+> same side), width = gap, caps r = gap/2, knee fillets in/out = R / R+gap — NOT the
+> pointed hexagon described in §2 below. The tessellation is a **single chain of
+> alternating smiles/frowns ON the bend line** (horizontal edges at v=0), not two
+> straddling rows; the "angled tab" is the strip between consecutive slots' parallel
+> end diagonals. Horizontal and diagonal lengths are constant across gauges; only
+> the gap scales with thickness. Implemented in `geometry.build_wave_cell` +
+> `generate_pattern`; §2/§4 below is the superseded original design, kept for history.
+
 A Fusion 360 add-in (Python) that draws SendCutSend-style "wave bend" relief-cut
 patterns along a chosen bend line in flat sheet metal, so a part can be folded by
 hand without a press brake. The pattern math was previously built in
