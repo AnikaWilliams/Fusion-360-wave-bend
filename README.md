@@ -13,9 +13,20 @@ Design phase complete. See the spec:
 
 | Path | What it is |
 |---|---|
+| `WaveBend/` | The packaged Fusion add-in (register this folder via Scripts and Add-Ins) |
+| `WaveBend/lib/geometry.py` | Pure pattern math (wave cells + chain solver; no `adsk`, unit-tested) |
+| `WaveBend/lib/fusion_build.py` | Fusion layer: sketch + one extrude-cut, body thickness/material readers |
+| `WaveBend/commands/waveBendCmd/` | The Wave Bend dialog command (template-based) |
+| `wave_bend_script.py` / `wave_bend_selftest/` | Stage-1a prototype + non-interactive verification script |
 | `docs/superpowers/specs/` | Design spec(s) |
 | `tools/` | Plain-Python DXF analysis scripts (run with `py`, no Fusion needed) |
 | `wave-bends.dxf` | SendCutSend reference pattern (ground truth for the cell shape) |
+
+## Run the tests
+
+```
+py -m unittest discover -s tests -p "test_*.py" -v
+```
 
 ## DXF tools
 

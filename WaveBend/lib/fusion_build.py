@@ -9,7 +9,10 @@
 # These are the most likely points of first-run failure.
 import math
 import adsk.core, adsk.fusion          # (verify against docs)
-import geometry as G
+try:
+    from . import geometry as G        # package context: the WaveBend add-in
+except ImportError:
+    import geometry as G               # script context: selftest puts lib/ on sys.path
 
 
 def _pt3d(origin, u_hat, v_hat, u, v):
