@@ -56,13 +56,16 @@ _auto = {'thickness': True, 'material': True, 'gap': True, 'tab': True, 'fillet'
 # Guard against the watcher reacting to its own rebuild.
 _rebuilding = False
 
-# Custom-feature definition: would give every Wave Bend cut ONE timeline node
-# carrying our wave icon. Constraint (live-tested 2026-07-09): CustomFeatures.add
-# only wraps features created inside the SAME command execution — never post-hoc,
-# never in a preview. Architecture therefore: executePreview draws the OUTLINE
-# sketch only (nothing destructive -> nothing rolls back -> selection stays);
-# execute creates sketch+cut AND wraps them right there. Fallback on any wrap
-# failure: plain named features in a named group — a cut is never lost.
+# Custom-feature definition: gives every Wave Bend cut ONE timeline node carrying
+# our wave icon. Two hard requirements (live-tested 2026-07-09/10):
+#   1. The add-in .manifest MUST have a non-empty "id" (UUID) or every
+#      CustomFeatures.add fails with 'RuntimeError: 3 : make params invalid'
+#      (see _wrap_custom_feature docstring).
+#   2. Wrapping happens inside a command's execute handler — never in a preview.
+# Architecture therefore: executePreview draws the OUTLINE sketch only (nothing
+# destructive -> nothing rolls back -> selection stays); execute creates
+# sketch+cut AND wraps them right there. Fallback on any wrap failure: plain
+# named features in a named group — a cut is never lost.
 ENABLE_TIMELINE_ICON = True
 _custom_def = None
 
@@ -191,27 +194,41 @@ def _snapshot_for(body):
     }
 
 
-def _wrap_custom_feature(comp, sk, cut, name):
-    """Fold the new features into ONE timeline node carrying the Wave Bend icon.
-    Tries sketch+cut first, then just the cut (a Sketch may not qualify as a
-    range start). Returns the custom feature's entityToken ('' if unavailable)."""
+def _wrap_custom_feature(comp, sk, cut, name, params=None):
+    """Fold the sketch + cut into ONE timeline node carrying the Wave Bend icon.
+
+    REQUIRES a non-empty "id" (any UUID) in the add-in .manifest: without it
+    every CustomFeatures.add call fails with the unrelated-sounding
+    'RuntimeError: 3 : make params invalid'. The docs claim the field "is not
+    used and can be left empty" and Fusion's own template omits it, but Fusion
+    needs it to associate custom features with their owning add-in
+    (forums.autodesk.com t5/.../error-when-adding-custom-feature/td-p/13777839).
+    The gap/tab custom parameters ride along so they show on the timeline node.
+    Returns the custom feature's entityToken ('' if unavailable)."""
     if not ENABLE_TIMELINE_ICON or _custom_def is None:
-        futil.log(f'WRAP skip: enable={ENABLE_TIMELINE_ICON} def={_custom_def}', force_console=True)
         return ''
     cfs = comp.features.customFeatures                     # (verify: customFeatures)
+    # sketch+cut is the normal wrap; cut-only is a degraded fallback that still
+    # gets the icon but leaves the build sketch as its own timeline node.
     for label, start, end in (('sk+cut', sk, cut), ('cut only', cut, cut)):
         try:
             ci = cfs.createInput(_custom_def)              # (verify: createInput)
+            if params:
+                # (verify: addCustomParameter(id, displayName, ValueInput, units, isVisible))
+                ci.addCustomParameter('gap', 'Gap', adsk.core.ValueInput.createByReal(
+                    params['gap']), 'cm', True)
+                ci.addCustomParameter('tab', 'Tab', adsk.core.ValueInput.createByReal(
+                    params['tab']), 'cm', True)
             ci.setStartAndEndFeatures(start, end)          # (verify: setStartAndEndFeatures)
             cf = cfs.add(ci)
             try:
                 cf.name = name
             except Exception:
                 pass
-            futil.log(f'WRAP OK ({label}): {name}', force_console=True)
+            futil.log(f'WRAP OK ({label}): {name}')
             return cf.entityToken
         except Exception as e:
-            futil.log(f'WRAP attempt {label} failed: {type(e).__name__}: {e}', force_console=True)
+            futil.log(f'WRAP attempt {label} failed: {type(e).__name__}: {e}')
             continue
     futil.log(f'{CMD_NAME}: custom-feature wrap failed (plain features kept)', force_console=True)
     return ''
@@ -292,14 +309,14 @@ def _build(inputs, sketch_only=False):
             name = f'Wave Bend ({pattern["count"]} slots)'
             if sketch_only:
                 FB.draw_pattern_sketch(comp, pattern, frame)
-                results.append({'pattern': pattern, 'cut': None})
+                results.append({'pattern': pattern, 'cut': None, 'wrapped': False})
                 continue
             sk, cut = FB.draw_and_cut(comp, pattern, frame, t, name=name)
-            cf_token = _wrap_custom_feature(comp, sk, cut, name)
+            cf_token = _wrap_custom_feature(comp, sk, cut, name, params=params)
             if not cf_token:
                 wrapped_all = False
             _tag_feature(cut, sk, line_geom, body, params, custom_token=cf_token)
-            results.append({'pattern': pattern, 'cut': cut})
+            results.append({'pattern': pattern, 'cut': cut, 'wrapped': bool(cf_token)})
         except Exception:
             futil.log(f'{CMD_NAME}: line {i + 1} failed:\n{traceback.format_exc()}')
             failures.append(i + 1)
@@ -442,7 +459,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
     units = _units()
 
-    global _auto, _cached_line_geoms
+    global _auto, _cached_line_geoms, _suppress
     _auto = {'thickness': True, 'material': True, 'gap': True, 'tab': True, 'fillet': True}
     _cached_line_geoms = []
 
@@ -472,6 +489,33 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     status = inputs.addTextBoxCommandInput(
         'status', 'Status', 'Select bend lines to preview the pattern.', 4, True)
     status.isFullWidth = True
+
+    # Adopt pre-selected bend lines (standard Fusion command behavior): anything the
+    # user (or automation) selected before launching the command flows into the input.
+    try:
+        pre = [ui.activeSelections.item(i).entity for i in range(ui.activeSelections.count)]
+        adopted = 0
+        for e in pre:
+            try:
+                if e.objectType in (adsk.fusion.SketchLine.classType(),
+                                    adsk.fusion.BRepEdge.classType()):
+                    if sel.addSelection(e):            # (verify: addSelection)
+                        adopted += 1
+            except Exception:
+                continue
+        if adopted:
+            # inputChanged does not fire for programmatic adds: seed manually.
+            _suppress = True
+            try:
+                live = _selected_entities(inputs)
+                if live:
+                    _cached_line_geoms = [_line_geom(e) for e in live]
+                _reseed_from_body(inputs)
+                _refresh_count(inputs)
+            finally:
+                _suppress = False
+    except Exception:
+        futil.log(f'{CMD_NAME}: preselection adoption failed:\n{traceback.format_exc()}')
 
     futil.add_handler(args.command.execute, command_execute, local_handlers=local_handlers)
     futil.add_handler(args.command.executePreview, command_preview, local_handlers=local_handlers)
@@ -641,8 +685,8 @@ def command_execute(args: adsk.core.CommandEventArgs):
         inputs = args.command.commandInputs
         results, warnings = _build(inputs, sketch_only=False)
         total = sum(r['pattern']['count'] for r in results)
-        wrapped = sum(1 for r in results if r['cut'] is not None)
-        _log_file('OK  WaveBend add-in: {} slots on {} line(s) ({} feature node(s))'.format(
+        wrapped = sum(1 for r in results if r.get('wrapped'))
+        _log_file('OK  WaveBend add-in: {} slots on {} line(s) ({} custom-feature node(s))'.format(
             total, len(results), wrapped))
     except Exception:
         _log_file('FAIL WaveBend add-in execute:\n' + traceback.format_exc())
@@ -855,7 +899,7 @@ def _rebuild_feature(design, attr, payload):
         name = f'Wave Bend ({pattern["count"]} slots)'
         comp = design.rootComponent
         sk_new, cut_new = FB.draw_and_cut(comp, pattern, frame, t, name=name)
-        cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name)
+        cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name, params=new_params)
         new_params = {'t': t, 'gap': gap, 'tab': tab, 'fil': fil, 'slot': slot,
                       'family': family}
         payload_new = {

@@ -1,6 +1,7 @@
 {
     "autodeskProduct": "Fusion",
     "type": "addin",
+    "id": "d4bfed17-77fb-4ee0-85c3-c955579c73b4",
     "author": "Anika Williams",
     "description": {
         "": "Wave-bend relief cuts: draws a SendCutSend-style wave pattern along a selected bend line in flat sheet metal so the part can be folded by hand."
