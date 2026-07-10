@@ -5,7 +5,7 @@
 # data path: measure thickness + read material from the body -> derive gap/tab/
 # fillet -> generate the wave chain -> sketch (model->sketch space) -> one cut.
 # Writes the result/traceback to <repo>/last_run.log.
-import os, sys, traceback
+import math, os, sys, traceback
 import adsk.core, adsk.fusion
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -140,7 +140,7 @@ def run(context):
                 wg.startPoint.x, wg.startPoint.y, wg.startPoint.z)
         except Exception:
             diag += " probe_model=unavailable"
-        FB.cut_sketch(root, sk, t)
+        FB.cut_sketch(root, sk, t, max_profile_diag_cm=math.hypot(cw, ch) * 1.2)
 
         _log("OK  selftest: bend L={:.3f}cm; {}".format(edge_len, diag))
         ui.messageBox("Wave-bend SELFTEST done. See last_run.log")

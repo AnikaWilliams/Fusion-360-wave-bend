@@ -58,6 +58,16 @@ def draw_pattern_sketch(comp, pattern, frame):
     """
     origin, u_hat, v_hat, _length, face = frame
     sk = comp.sketches.add(face)                       # (verify: sketches.add(planarFace))
+    # Fusion may AUTO-PROJECT the face's boundary edges into a new face sketch
+    # ("Auto project edges on reference" preference). Those projected curves close a
+    # face-sized profile, and a cut over all profiles would then consume the whole
+    # plate (observed in selftest run #3). Purge everything present before we draw --
+    # anything already in this sketch is not ours.
+    for i in range(sk.sketchCurves.count - 1, -1, -1):
+        try:
+            sk.sketchCurves.item(i).deleteMe()         # (verify: SketchCurve.deleteMe)
+        except Exception:
+            pass                                       # locked/undeletable refs: leave them
 
     def sp(u, v):
         # local (u,v) -> model Point3D -> THIS sketch's coordinates (verify: modelToSketchSpace)
@@ -81,11 +91,23 @@ def draw_pattern_sketch(comp, pattern, frame):
     return sk
 
 
-def cut_sketch(comp, sk, depth_cm):
-    """One extrude-cut consuming every closed profile in `sk`, through the sheet thickness."""
+def cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=None):
+    """One extrude-cut consuming the closed slot profiles in `sk`, through the sheet.
+
+    If max_profile_diag_cm is given, profiles whose bounding-box diagonal exceeds it
+    are skipped -- a second line of defense against a face-sized profile (from
+    auto-projected boundary edges) turning the relief cut into cut-away-the-plate.
+    """
     prof_coll = adsk.core.ObjectCollection.create()
     for p in sk.profiles:
+        if max_profile_diag_cm is not None:
+            bb = p.boundingBox                          # (verify: Profile.boundingBox)
+            diag = math.hypot(bb.maxPoint.x - bb.minPoint.x, bb.maxPoint.y - bb.minPoint.y)
+            if diag > max_profile_diag_cm:
+                continue                                # not a slot; never cut it
         prof_coll.add(p)
+    if prof_coll.count == 0:
+        raise RuntimeError("no slot-sized profiles to cut (sketch profile filtering)")
     extrudes = comp.features.extrudeFeatures
     cut_input = extrudes.createInput(
         prof_coll, adsk.fusion.FeatureOperations.CutFeatureOperation)   # (verify enum)
@@ -100,7 +122,14 @@ def cut_sketch(comp, sk, depth_cm):
 def draw_and_cut(comp, pattern, frame, depth_cm):
     """Convenience: draw the pattern sketch, then cut it. Returns the cut feature."""
     sk = draw_pattern_sketch(comp, pattern, frame)
-    return cut_sketch(comp, sk, depth_cm)
+    # slot-size ceiling for the profile filter: the largest cell bbox diagonal + slack
+    diag = 0.0
+    for prof in pattern["profiles"][:2]:               # smile + frown suffice
+        pts = G.sample_profile(prof, n=4)
+        w = max(p.x for p in pts) - min(p.x for p in pts)
+        h = max(p.y for p in pts) - min(p.y for p in pts)
+        diag = max(diag, math.hypot(w, h))
+    return cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=diag * 1.2)
 
 
 # ---- Task 7: read thickness + material from the body --------------------------
