@@ -194,7 +194,7 @@ def _snapshot_for(body):
     }
 
 
-def _wrap_custom_feature(comp, sk, cut, name, params=None):
+def _wrap_custom_feature(comp, sk, cut, name):
     """Fold the sketch + cut into ONE timeline node carrying the Wave Bend icon.
 
     REQUIRES a non-empty "id" (any UUID) in the add-in .manifest: without it
@@ -203,33 +203,44 @@ def _wrap_custom_feature(comp, sk, cut, name, params=None):
     used and can be left empty" and Fusion's own template omits it, but Fusion
     needs it to associate custom features with their owning add-in
     (forums.autodesk.com t5/.../error-when-adding-custom-feature/td-p/13777839).
-    The gap/tab custom parameters ride along so they show on the timeline node.
+
+    NO custom parameters, deliberately: every custom parameter automatically
+    becomes a dependency of the feature, so any touch of it fires a
+    customFeatureCompute event that nothing here answers (the wrapped extrude
+    is outside the supported compute-edit set) — a feature stuck waiting on an
+    unanswered compute is a known way to wedge a document. Autodesk's
+    RoundEmboss sample (same shape as ours: wrapped sketch+extrude, no compute
+    handler) only adds parameters it wires into the wrapped features' native
+    parameters; gap/tab have no native counterpart, so they stay out. The cut's
+    values are persisted in the feature attributes instead (_tag_feature).
+
+    Single attempt, deliberately: retrying customFeatures.add inside the same
+    command transaction after a failure can commit partially-created custom-
+    feature state (documented in the custom-feature feedback thread).
     Returns the custom feature's entityToken ('' if unavailable)."""
     if not ENABLE_TIMELINE_ICON or _custom_def is None:
         return ''
     cfs = comp.features.customFeatures                     # (verify: customFeatures)
-    # sketch+cut is the normal wrap; cut-only is a degraded fallback that still
-    # gets the icon but leaves the build sketch as its own timeline node.
-    for label, start, end in (('sk+cut', sk, cut), ('cut only', cut, cut)):
+    before = cfs.count
+    try:
+        ci = cfs.createInput(_custom_def)                  # (verify: createInput)
+        ci.setStartAndEndFeatures(sk, cut)                 # (verify: setStartAndEndFeatures)
+        cf = cfs.add(ci)
         try:
-            ci = cfs.createInput(_custom_def)              # (verify: createInput)
-            if params:
-                # (verify: addCustomParameter(id, displayName, ValueInput, units, isVisible))
-                ci.addCustomParameter('gap', 'Gap', adsk.core.ValueInput.createByReal(
-                    params['gap']), 'cm', True)
-                ci.addCustomParameter('tab', 'Tab', adsk.core.ValueInput.createByReal(
-                    params['tab']), 'cm', True)
-            ci.setStartAndEndFeatures(start, end)          # (verify: setStartAndEndFeatures)
-            cf = cfs.add(ci)
-            try:
-                cf.name = name
-            except Exception:
-                pass
-            futil.log(f'WRAP OK ({label}): {name}')
-            return cf.entityToken
-        except Exception as e:
-            futil.log(f'WRAP attempt {label} failed: {type(e).__name__}: {e}')
-            continue
+            cf.name = name
+        except Exception:
+            pass
+        futil.log(f'WRAP OK: {name}')
+        return cf.entityToken
+    except Exception as e:
+        futil.log(f'WRAP failed: {type(e).__name__}: {e}')
+        # A failed add must leave nothing behind — partial custom-feature state
+        # committed with the transaction can corrupt the document.
+        try:
+            while cfs.count > before:
+                cfs.item(cfs.count - 1).deleteMe()
+        except Exception:
+            pass
     futil.log(f'{CMD_NAME}: custom-feature wrap failed (plain features kept)', force_console=True)
     return ''
 
@@ -312,7 +323,7 @@ def _build(inputs, sketch_only=False):
                 results.append({'pattern': pattern, 'cut': None, 'wrapped': False})
                 continue
             sk, cut = FB.draw_and_cut(comp, pattern, frame, t, name=name)
-            cf_token = _wrap_custom_feature(comp, sk, cut, name, params=params)
+            cf_token = _wrap_custom_feature(comp, sk, cut, name)
             if not cf_token:
                 wrapped_all = False
             _tag_feature(cut, sk, line_geom, body, params, custom_token=cf_token)
@@ -899,7 +910,7 @@ def _rebuild_feature(design, attr, payload):
         name = f'Wave Bend ({pattern["count"]} slots)'
         comp = design.rootComponent
         sk_new, cut_new = FB.draw_and_cut(comp, pattern, frame, t, name=name)
-        cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name, params=new_params)
+        cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name)
         new_params = {'t': t, 'gap': gap, 'tab': tab, 'fil': fil, 'slot': slot,
                       'family': family}
         payload_new = {
