@@ -26,6 +26,10 @@ ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resource
 
 local_handlers = []
 
+# Success report deferred to the destroy handler: a blocking messageBox inside
+# execute keeps the (already-finished) command dialog lingering behind it.
+_pending_report = None
+
 
 def start():
     # Idempotent: a stale definition/control from a crashed reload must not block us.
@@ -108,8 +112,14 @@ def command_validate(args: adsk.core.ValidateInputsEventArgs):
 
 
 def command_destroy(args: adsk.core.CommandEventArgs):
-    global local_handlers
+    global local_handlers, _pending_report
     local_handlers = []
+    if _pending_report:
+        msg, _pending_report = _pending_report, None
+        try:
+            ui.messageBox(msg, 'Wave Bend — Export DXF')
+        except Exception:
+            pass
 
 
 def _default_filename(face):
@@ -134,6 +144,7 @@ def _ask_save_path(face):
 
 
 def command_execute(args: adsk.core.CommandEventArgs):
+    global _pending_report
     futil.log(f'{CMD_NAME} Command Execute Event')
     sk = None
     try:
@@ -194,12 +205,10 @@ def command_execute(args: adsk.core.CommandEventArgs):
                          for k, v in sorted(stats.items()))
         futil.log(f'{CMD_NAME}: wrote {out_path} (scale x{scale:g}, {how}; {ents})',
                   force_console=True)
-        ui.messageBox(f'DXF exported (1:1 mm):\n{out_path}\n\n{ents}',
-                      'Wave Bend — Export DXF')
+        _pending_report = f'DXF exported (1:1 mm):\n{out_path}\n\n{ents}'
     except Exception:
         futil.log(f'{CMD_NAME} failed:\n{traceback.format_exc()}', force_console=True)
-        ui.messageBox('DXF export failed — see Text Commands for details.',
-                      'Wave Bend — Export DXF')
+        _pending_report = 'DXF export failed — see Text Commands for details.'
     finally:
         if sk is not None:
             try:
