@@ -45,25 +45,32 @@ def _bbox(pts):
     xs = [p.x for p in pts]; ys = [p.y for p in pts]
     return min(xs), min(ys), max(xs), max(ys)
 
-def _polyline_pair_distance(A, B):
+def _polyline_pair_distance(A, B, stop_below=0.0):
     """Minimum distance between two sampled polylines, checked in BOTH directions:
     A-points->B-segments AND B-points->A-segments. A one-sided check can over-report
     the true minimum when the closest feature is a vertex of one polyline projecting
-    onto the interior of a segment of the other."""
+    onto the interior of a segment of the other.
+
+    stop_below: early exit — once the running minimum drops under this value the
+    caller only cares THAT it is under, not by how much (feasibility checks)."""
     best = float("inf")
     for p in A:
         for k in range(len(B) - 1):
             d = point_seg_distance(p, B[k], B[k + 1])
             if d < best:
                 best = d
+                if best < stop_below:
+                    return best
     for p in B:
         for k in range(len(A) - 1):
             d = point_seg_distance(p, A[k], A[k + 1])
             if d < best:
                 best = d
+                if best < stop_below:
+                    return best
     return best
 
-def min_profile_distance(profiles, n=12):
+def min_profile_distance(profiles, n=12, stop_below=0.0):
     polys = [sample_profile(p, n) for p in profiles]
     boxes = [_bbox(p) for p in polys]
     best = float("inf")
@@ -75,9 +82,11 @@ def min_profile_distance(profiles, n=12):
             gap_y = max(bi[1] - bj[3], bj[1] - bi[3], 0.0)
             if math.hypot(gap_x, gap_y) >= best:
                 continue
-            d = _polyline_pair_distance(polys[i], polys[j])
+            d = _polyline_pair_distance(polys[i], polys[j], stop_below=stop_below)
             if d < best:
                 best = d
+                if best < stop_below:
+                    return best
     return best
 
 def fillet_corner(A, B, C, R):
@@ -400,21 +409,50 @@ def cell_halfwidth(style, slot_len, gap, fillet_r, end_angle_deg=40.0,
 # Tessellation: a single cell chain along the bend line
 # ---------------------------------------------------------------------------
 
-def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th, diag_len,
-                            style=STYLE_WAVE):
-    """Four consecutive slots at this per-slot pitch; tightest gap between any two.
+# Solver probe sampling (chords per segment). Serpentine's big lobe arcs need
+# finer chords to keep the sampling-error margin (and thus the safety padding
+# added to the solved pitch) small.
+_PROBE_N = {STYLE_SERPENTINE: 10}
+_FINAL_N = 12                     # generate_pattern's reporting density
 
-    Alternating styles flip orientation cell to cell, so four cells cover both
-    junction types AND the same-orientation second-neighbour clearance. Coarse
-    sampling (n=6) is safe: the binding ligaments are between parallel edges,
-    where point-to-segment distance is exact at any density.
+
+def _probe_n(style):
+    return _PROBE_N.get(style, 6)
+
+
+def _sampling_margin(cell, n_probe, n_final=_FINAL_N):
+    """Upper bound on how much chord-sampling can misreport an arc-to-arc
+    distance, combined for the probe and the final measurement densities.
+    A chord deviates from its arc by at most the sagitta r*(1-cos(sweep/2n));
+    two facing arcs can each contribute one sagitta, at either density."""
+    m = 0.0
+    for seg in cell:
+        if seg[0] == "arc":
+            _, _c, r, a0, a1, _p0, _p1 = seg
+            sweep = abs(a1 - a0)
+            sag = lambda n: r * (1.0 - math.cos(sweep / (2.0 * n)))
+            m = max(m, 2.0 * sag(n_probe) + 2.0 * sag(n_final))
+    return m
+
+
+def _min_ligament_for_pitch(pitch, slot_len, gap, tab, fillet_r, th, diag_len,
+                            style=STYLE_WAVE, stop_below=0.0):
+    """Three consecutive slots at this per-slot pitch; tightest gap between any two.
+
+    Three cells cover every neighbour class of the periodic chain: both junction
+    types for alternating styles ((0,1) up-down and (1,2) down-up) and the
+    same-orientation second-neighbour pair (0,2) — our alternating cells are
+    exact mirrors, so the mirrored second-neighbour pair has the same distance
+    by symmetry. Straight-edge ligaments are exact at any sampling density;
+    arc-to-arc ligaments carry a bounded chord error that solve_pitch covers
+    with _sampling_margin.
     """
     alt = style_alternates(style)
     cells = [build_cell(style, slot_len, gap, fillet_r, th, diag_len,
                         orient=+1 if (not alt or i % 2 == 0) else -1,
                         cx=i * pitch, cy=0.0)
-             for i in range(4)]
-    return min_profile_distance(cells, n=6)
+             for i in range(3)]
+    return min_profile_distance(cells, n=_probe_n(style), stop_below=stop_below)
 
 
 def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48,
@@ -422,34 +460,50 @@ def solve_pitch(slot_len, gap, tab, fillet_r, end_angle_deg=40.0, samples=48,
     """Smallest per-slot pitch whose every ligament is >= tab (densest valid chain).
 
     Feasibility is monotone in pitch (spreading slots apart only widens every
-    ligament), so the search window GROWS until a feasible pitch is found.
+    ligament), so the search brackets the feasibility boundary by doubling and
+    then bisects it — ~15 ligament evaluations instead of the 48-per-window
+    linear scan this replaces, and each evaluation aborts as soon as any
+    ligament drops under `tab`. `samples` is kept for signature compatibility.
     Raises ValueError only past a hard cap (degenerate cell geometry).
     """
     th = end_angle_deg
     sin_th = math.sin(math.radians(th))
+    # Degenerate cell inputs (bad fillet/gap/slot) must surface immediately —
+    # the cell does not depend on pitch, so one probe build validates them all.
+    probe_cell = build_cell(style, slot_len, gap, fillet_r, th, diag_len)
+    # Solve against tab PLUS the chord-sampling error bound, so the finely
+    # sampled ligament generate_pattern reports still clears tab.
+    threshold = tab + _sampling_margin(probe_cell, _probe_n(style))
+
+    def feasible(p):
+        return _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th,
+                                       diag_len, style=style,
+                                       stop_below=threshold) >= threshold - 1e-6
+
     if style_alternates(style) and style != STYLE_SERPENTINE:
         # Below roughly (tab+gap)/sin(th) the diagonal ligament cannot reach `tab`.
         lo = 0.7 * (tab + gap) / sin_th
     else:
         # Non-interleaving cells sit side by side: pitch >= cell width + tab.
         lo = max(0.5 * slot_len, tab)
-    hi = max(2.0 * slot_len, (tab + gap) / sin_th * 2.0)
+    hi = max(2.0 * slot_len, (tab + gap) / sin_th * 2.0, lo * 1.5)
     cap = 64.0 * (slot_len + tab + gap)  # backstop against an unbounded loop
-    while True:
-        step = (hi - lo) / samples
-        feasible = []
-        p = lo
-        while p <= hi + 1e-12:
-            if _min_ligament_for_pitch(p, slot_len, gap, tab, fillet_r, th,
-                                       diag_len, style=style) >= tab - 1e-6:
-                feasible.append(p)
-            p += step
-        if feasible:
-            return min(feasible)         # smallest feasible pitch = densest chain
+    while not feasible(hi):
         if hi >= cap:
             raise ValueError(
                 "no feasible pitch found below cap (degenerate cell geometry?)")
-        lo, hi = hi, min(hi * 2.0, cap)  # feasibility is above -> search the next window
+        lo, hi = hi, min(hi * 2.0, cap)
+    if feasible(lo):
+        return lo
+    for _ in range(60):                  # bisect the boundary; hi stays feasible
+        if hi - lo <= 1e-4:
+            break
+        mid = (lo + hi) / 2.0
+        if feasible(mid):
+            hi = mid
+        else:
+            lo = mid
+    return hi
 
 
 def fit_count(bend_len, pitch, margin):

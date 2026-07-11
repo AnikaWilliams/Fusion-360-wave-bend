@@ -61,36 +61,48 @@ def draw_pattern_sketch(comp, pattern, frame):
     """
     origin, u_hat, v_hat, _length, face = frame
     sk = comp.sketches.add(face)                       # (verify: sketches.add(planarFace))
-    # Fusion may AUTO-PROJECT the face's boundary edges into a new face sketch
-    # ("Auto project edges on reference" preference). Those projected curves close a
-    # face-sized profile, and a cut over all profiles would then consume the whole
-    # plate (observed in selftest run #3). Purge everything present before we draw --
-    # anything already in this sketch is not ours.
-    for i in range(sk.sketchCurves.count - 1, -1, -1):
+    try:
+        # Defer sketch compute while bulk-editing: every add/delete otherwise
+        # triggers a full constraint solve, which dominates preview time for
+        # dense patterns. (verify: isComputeDeferred)
+        sk.isComputeDeferred = True
+        # Fusion may AUTO-PROJECT the face's boundary edges into a new face sketch
+        # ("Auto project edges on reference" preference). Those projected curves close a
+        # face-sized profile, and a cut over all profiles would then consume the whole
+        # plate (observed in selftest run #3). Purge everything present before we draw --
+        # anything already in this sketch is not ours.
+        for i in range(sk.sketchCurves.count - 1, -1, -1):
+            try:
+                sk.sketchCurves.item(i).deleteMe()     # (verify: SketchCurve.deleteMe)
+            except Exception:
+                pass                                   # locked/undeletable refs: leave them
+
+        def sp(u, v):
+            # local (u,v) -> model Point3D -> THIS sketch's coordinates (verify: modelToSketchSpace)
+            return sk.modelToSketchSpace(_pt3d(origin, u_hat, v_hat, u, v))
+
+        lines = sk.sketchCurves.sketchLines
+        arcs = sk.sketchCurves.sketchArcs
+        for profile in pattern["profiles"]:
+            for seg in profile:
+                if seg[0] == "line":
+                    _, a, b = seg
+                    if math.hypot(b.x - a.x, b.y - a.y) < _MIN_SEG_CM:
+                        continue                       # adjacent arcs already meet; skip the stub
+                    lines.addByTwoPoints(sp(a.x, a.y), sp(b.x, b.y))
+                else:
+                    _, c, r, a0, a1, a, b = seg
+                    am = (a0 + a1) / 2.0
+                    mid = G.Pt(c.x + r * math.cos(am), c.y + r * math.sin(am))
+                    arcs.addByThreePoints(             # (verify: addByThreePoints)
+                        sp(a.x, a.y), sp(mid.x, mid.y), sp(b.x, b.y))
+    finally:
+        # ALWAYS resume compute -- profiles are only valid once the sketch solves,
+        # and cut_sketch reads sk.profiles right after this returns.
         try:
-            sk.sketchCurves.item(i).deleteMe()         # (verify: SketchCurve.deleteMe)
+            sk.isComputeDeferred = False
         except Exception:
-            pass                                       # locked/undeletable refs: leave them
-
-    def sp(u, v):
-        # local (u,v) -> model Point3D -> THIS sketch's coordinates (verify: modelToSketchSpace)
-        return sk.modelToSketchSpace(_pt3d(origin, u_hat, v_hat, u, v))
-
-    lines = sk.sketchCurves.sketchLines
-    arcs = sk.sketchCurves.sketchArcs
-    for profile in pattern["profiles"]:
-        for seg in profile:
-            if seg[0] == "line":
-                _, a, b = seg
-                if math.hypot(b.x - a.x, b.y - a.y) < _MIN_SEG_CM:
-                    continue                           # adjacent arcs already meet; skip the stub
-                lines.addByTwoPoints(sp(a.x, a.y), sp(b.x, b.y))
-            else:
-                _, c, r, a0, a1, a, b = seg
-                am = (a0 + a1) / 2.0
-                mid = G.Pt(c.x + r * math.cos(am), c.y + r * math.sin(am))
-                arcs.addByThreePoints(                 # (verify: addByThreePoints)
-                    sp(a.x, a.y), sp(mid.x, mid.y), sp(b.x, b.y))
+            pass
     return sk
 
 

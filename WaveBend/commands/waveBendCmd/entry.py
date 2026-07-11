@@ -76,10 +76,12 @@ _custom_def = None
 _cached_line_geoms = []          # [((x0,y0,z0), (x1,y1,z1)), ...]
 
 # Cached linear pitch model: solve_pitch is too slow to run per dialog edit, but for
-# fixed (gap, tab, fillet, angle, diag) the solved pitch tracks slot_len almost
-# exactly as  pitch = slot_len + C.  We solve C once per parameter combination and
-# do the interlink algebraically; the preview/execute path uses the real solver.
-_pitch_model = {'key': None, 'C': None}
+# fixed (gap, tab, fillet, style) the solved pitch tracks slot_len almost exactly
+# as  pitch = slot_len + C.  We solve C once per parameter combination (kept for
+# the whole session, so flipping between styles never re-solves) and do the
+# interlink algebraically; the preview/execute path uses the real solver.
+_pitch_model = {}                 # (gap, tab, fil, style) -> C
+_PITCH_MODEL_MAX = 64
 
 # Cached solved patterns for the preview/execute path (multiple entries: one per
 # selected line length). Only genuinely NEW parameter combinations pay the ~1s solve.
@@ -124,12 +126,13 @@ def _style(inputs):
 def _pitch_C(slot_len, gap, tab, fil, style):
     """C in the linear model pitch = slot_len + C, cached per (gap, tab, fil, style)."""
     key = (round(gap, 6), round(tab, 6), round(fil, 6), style)
-    if _pitch_model['key'] != key:
+    if key not in _pitch_model:
+        if len(_pitch_model) >= _PITCH_MODEL_MAX:
+            _pitch_model.clear()
         p = G.solve_pitch(slot_len, gap, tab, fil, config.DEFAULT_END_ANGLE_DEG,
                           diag_len=config.DEFAULT_DIAG_LEN_CM, style=style)
-        _pitch_model['key'] = key
-        _pitch_model['C'] = p - slot_len
-    return _pitch_model['C']
+        _pitch_model[key] = p - slot_len
+    return _pitch_model[key]
 
 
 def _margin(slot_len, gap, fil, style):

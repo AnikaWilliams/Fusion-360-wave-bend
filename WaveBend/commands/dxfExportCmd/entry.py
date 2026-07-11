@@ -163,12 +163,19 @@ def command_execute(args: adsk.core.CommandEventArgs):
         # face explicitly — its boundary arrives as outer outline + one closed
         # loop per cut.
         sk = comp.sketches.add(face)                        # (verify: sketches.add)
-        for i in range(sk.sketchCurves.count - 1, -1, -1):
+        try:
+            sk.isComputeDeferred = True                     # bulk edit: solve once at the end
+            for i in range(sk.sketchCurves.count - 1, -1, -1):
+                try:
+                    sk.sketchCurves.item(i).deleteMe()
+                except Exception:
+                    pass
+            sk.project(face)                                # (verify: Sketch.project)
+        finally:
             try:
-                sk.sketchCurves.item(i).deleteMe()
+                sk.isComputeDeferred = False                # saveAsDXF needs a solved sketch
             except Exception:
                 pass
-        sk.project(face)                                    # (verify: Sketch.project)
 
         tmp_path = out_path + '.tmp'
         if not sk.saveAsDXF(tmp_path):                      # (verify: saveAsDXF)
