@@ -15,6 +15,31 @@ DEFAULT_END_ANGLE_DEG = 40.0
 DEFAULT_SLOT_LEN_CM = 1.651   # ~0.65 in: the slot's HORIZONTAL run, constant across gauges (DXF)
 DEFAULT_DIAG_LEN_CM = 0.4826  # ~0.19 in: swept diagonal end length, constant across gauges (DXF)
 
+# -- pattern styles ---------------------------------------------------------------
+# (geometry style key, dialog label). Keys match geometry.PATTERN_STYLES.
+PATTERN_STYLE_LABELS = (
+    ('wave', 'Wave (SendCutSend)'),
+    ('slot', 'Straight slots'),
+    ('zigzag', 'Zigzag'),
+    ('diamond', 'Diamond'),
+    ('serpentine', 'Serpentine'),
+)
+DEFAULT_PATTERN_STYLE = 'wave'
+
+
+def pattern_style_for_label(label):
+    for key, lbl in PATTERN_STYLE_LABELS:
+        if lbl == label:
+            return key
+    return DEFAULT_PATTERN_STYLE
+
+
+def pattern_label_for_style(style):
+    for key, lbl in PATTERN_STYLE_LABELS:
+        if key == style:
+            return lbl
+    return PATTERN_STYLE_LABELS[0][1]
+
 # substring (lowercased) -> gap multiplier m
 MATERIAL_MULTIPLIERS = {
     "alumin": 0.6,

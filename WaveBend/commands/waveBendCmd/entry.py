@@ -114,22 +114,29 @@ def _fmt(value_cm):
         return f'{value_cm:.3f} cm'
 
 
-def _pitch_C(slot_len, gap, tab, fil):
-    """C in the linear model pitch = slot_len + C, cached per (gap, tab, fil)."""
-    key = (round(gap, 6), round(tab, 6), round(fil, 6))
+def _style(inputs):
+    """Selected pattern style key ('wave', 'slot', ...)."""
+    dd = inputs.itemById('patternStyle')
+    item = dd.selectedItem if dd else None
+    return config.pattern_style_for_label(item.name) if item else config.DEFAULT_PATTERN_STYLE
+
+
+def _pitch_C(slot_len, gap, tab, fil, style):
+    """C in the linear model pitch = slot_len + C, cached per (gap, tab, fil, style)."""
+    key = (round(gap, 6), round(tab, 6), round(fil, 6), style)
     if _pitch_model['key'] != key:
         p = G.solve_pitch(slot_len, gap, tab, fil, config.DEFAULT_END_ANGLE_DEG,
-                          diag_len=config.DEFAULT_DIAG_LEN_CM)
+                          diag_len=config.DEFAULT_DIAG_LEN_CM, style=style)
         _pitch_model['key'] = key
         _pitch_model['C'] = p - slot_len
     return _pitch_model['C']
 
 
-def _margin(slot_len, gap):
-    """Same solid end-margin rule generate_pattern uses (closed form for the cell width)."""
-    th = math.radians(config.DEFAULT_END_ANGLE_DEG)
-    cell_w = slot_len + 2.0 * config.DEFAULT_DIAG_LEN_CM * math.cos(th) + gap
-    return cell_w / 2.0 + gap
+def _margin(slot_len, gap, fil, style):
+    """Same solid end-margin rule generate_pattern uses (probe-based cell width)."""
+    half_w = G.cell_halfwidth(style, slot_len, gap, fil,
+                              config.DEFAULT_END_ANGLE_DEG, config.DEFAULT_DIAG_LEN_CM)
+    return half_w + gap
 
 
 def _selected_entities(inputs):
@@ -172,15 +179,16 @@ def _set_status(inputs, text):
         box.text = text
 
 
-def _get_pattern(bend_len, gap, tab, fil, slot):
+def _get_pattern(bend_len, gap, tab, fil, slot, style):
     """Exact-solver pattern, cached per parameter combination."""
-    key = tuple(round(v, 6) for v in (bend_len, gap, tab, fil, slot))
+    key = tuple(round(v, 6) for v in (bend_len, gap, tab, fil, slot)) + (style,)
     if key not in _pattern_cache:
         if len(_pattern_cache) >= _PATTERN_CACHE_MAX:
             _pattern_cache.clear()
         _pattern_cache[key] = G.generate_pattern(
             bend_len, gap, tab, slot, fil,
-            config.DEFAULT_END_ANGLE_DEG, diag_len=config.DEFAULT_DIAG_LEN_CM)
+            config.DEFAULT_END_ANGLE_DEG, diag_len=config.DEFAULT_DIAG_LEN_CM,
+            style=style)
     return _pattern_cache[key]
 
 
@@ -287,10 +295,11 @@ def _build(inputs, sketch_only=False):
     tab = inputs.itemById('tab').value
     fil = inputs.itemById('fillet').value
     slot = inputs.itemById('slotLen').value
+    style = _style(inputs)
     dd = inputs.itemById('material').selectedItem
     family = dd.name if dd else config.FAMILY_ALUMINUM
     params = {'t': t, 'gap': gap, 'tab': tab, 'fil': fil, 'slot': slot,
-              'family': family}
+              'family': family, 'style': style}
 
     design = adsk.fusion.Design.cast(app.activeProduct)
     comp = design.rootComponent
@@ -300,7 +309,7 @@ def _build(inputs, sketch_only=False):
     jobs, warnings = [], []
     for i, frame in enumerate(frames):
         body = FB.find_host_body(frame)
-        pattern = _get_pattern(frame[3], gap, tab, fil, slot)   # may raise ValueError
+        pattern = _get_pattern(frame[3], gap, tab, fil, slot, style)   # may raise ValueError
         if not FB.pattern_clearance_ok(body, frame, pattern):
             warnings.append(f'line {i + 1}: pattern extends past the part edge or into a cutout')
         origin, u_hat, _v, length, _f = frame
@@ -317,7 +326,7 @@ def _build(inputs, sketch_only=False):
             # ALWAYS re-resolve the frame from raw coordinates: an earlier cut may
             # have split/replaced the face, and coordinate lookup is immune to that.
             frame = FB.frame_from_points(*line_geom)
-            name = f'Wave Bend ({pattern["count"]} slots)'
+            name = _feature_name(style, pattern["count"])
             if sketch_only:
                 FB.draw_pattern_sketch(comp, pattern, frame)
                 results.append({'pattern': pattern, 'cut': None, 'wrapped': False})
@@ -353,6 +362,13 @@ def _build(inputs, sketch_only=False):
     for i in failures:
         warnings.append(f'line {i} FAILED to cut (others succeeded) — see Text Commands')
     return results, warnings
+
+
+def _feature_name(style, count):
+    """Timeline node name; the style is called out for everything but the classic wave."""
+    if style == config.DEFAULT_PATTERN_STYLE:
+        return f'Wave Bend ({count} slots)'
+    return f'Wave Bend ({config.pattern_label_for_style(style)}, {count} slots)'
 
 
 def _status_summary(inputs, results, warnings):
@@ -480,6 +496,11 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     sel.addSelectionFilter('SketchLines')
     sel.setSelectionLimits(1, 0)                       # 1..unlimited
 
+    style_dd = inputs.addDropDownCommandInput(
+        'patternStyle', 'Pattern style', adsk.core.DropDownStyles.TextListDropDownStyle)
+    for key, label in config.PATTERN_STYLE_LABELS:
+        style_dd.listItems.add(label, key == config.DEFAULT_PATTERN_STYLE)
+
     t = _FALLBACK_T_CM
     gap = config.default_gap_cm(t, config.FAMILY_ALUMINUM)
     inputs.addValueInput('thickness', 'Thickness', units,
@@ -586,9 +607,11 @@ def _refresh_count(inputs):
     tab = inputs.itemById('tab').value
     fil = inputs.itemById('fillet').value
     slot = inputs.itemById('slotLen').value
+    style = _style(inputs)
     try:
-        pitch = slot + _pitch_C(slot, gap, tab, fil)
-        inputs.itemById('slotCount').value = G.fit_count(B, pitch, _margin(slot, gap))
+        pitch = slot + _pitch_C(slot, gap, tab, fil, style)
+        inputs.itemById('slotCount').value = G.fit_count(B, pitch,
+                                                         _margin(slot, gap, fil, style))
     except ValueError:
         futil.log(f'{CMD_NAME}: infeasible combination, count not updated')
 
@@ -603,17 +626,20 @@ def _slot_from_count(inputs):
     fil = inputs.itemById('fillet').value
     count = inputs.itemById('slotCount').value
     slot_now = inputs.itemById('slotLen').value
+    style = _style(inputs)
     try:
-        C = _pitch_C(slot_now, gap, tab, fil)
+        C = _pitch_C(slot_now, gap, tab, fil, style)
     except ValueError:
         futil.log(f'{CMD_NAME}: infeasible combination, slot length not updated')
         return
-    th = math.radians(config.DEFAULT_END_ANGLE_DEG)
-    # usable(slot) = B - cell_w(slot) - 2*gap ; target pitch = usable / (count - 0.5)
-    K = 2.0 * config.DEFAULT_DIAG_LEN_CM * math.cos(th) + 3.0 * gap
+    # usable(slot) = B - cell_w(slot) - 2*gap ; target pitch = usable / (count - 0.5).
+    # K folds the style's slot-independent width overhead into the linear model:
+    # cell_w(slot) + 2*gap ~= slot + K (cell width grows ~1:1 with slot length).
+    K = (2.0 * G.cell_halfwidth(style, slot_now, gap, fil, config.DEFAULT_END_ANGLE_DEG,
+                                config.DEFAULT_DIAG_LEN_CM) - slot_now + 2.0 * gap)
     q = max(count - 0.5, 0.5)
     slot = (B - K - q * C) / (q + 1.0)
-    min_slot = max(4.0 * fil, 0.2)
+    min_slot = max(4.0 * fil, 0.2, 2.3 * gap)          # serpentine/slot/diamond floors
     if slot < min_slot:
         futil.log(f'{CMD_NAME}: {count} slots need slot_len<{min_slot:.2f} cm; clamped')
         slot = min_slot
@@ -643,7 +669,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         elif cid in ('thickness', 'material'):
             _reseed_derived(inputs)
             _refresh_count(inputs)
-        elif cid in ('gap', 'tab', 'fillet', 'slotLen'):
+        elif cid in ('gap', 'tab', 'fillet', 'slotLen', 'patternStyle'):
             _refresh_count(inputs)
         elif cid == 'slotCount':
             _slot_from_count(inputs)          # last-edited-wins: do NOT recompute count
@@ -874,10 +900,11 @@ def _rebuild_feature(design, attr, payload):
         tab = (config.default_tab_cm(t) if auto.get('tab', True) else params['tab'])
         fil = (config.default_fillet_cm(gap) if auto.get('fillet', True) else params['fil'])
         slot = params['slot']
+        style = params.get('style', config.DEFAULT_PATTERN_STYLE)
 
         # Validate the new pattern BEFORE touching the old feature.
         frame = FB.frame_from_points(*line_geom)
-        pattern = _get_pattern(frame[3], gap, tab, fil, slot)   # ValueError -> untouched
+        pattern = _get_pattern(frame[3], gap, tab, fil, slot, style)   # ValueError -> untouched
     except ValueError as e:
         futil.log(f'WaveBend update: new parameters infeasible, feature left as-is: {e}')
         return False
@@ -907,12 +934,12 @@ def _rebuild_feature(design, attr, payload):
             except Exception:
                 pass
         frame = FB.frame_from_points(*line_geom)       # fresh after the delete
-        name = f'Wave Bend ({pattern["count"]} slots)'
+        name = _feature_name(style, pattern["count"])
         comp = design.rootComponent
         sk_new, cut_new = FB.draw_and_cut(comp, pattern, frame, t, name=name)
         cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name)
         new_params = {'t': t, 'gap': gap, 'tab': tab, 'fil': fil, 'slot': slot,
-                      'family': family}
+                      'family': family, 'style': style}
         payload_new = {
             'version': ATTR_VERSION,
             'line_geom': line_geom,

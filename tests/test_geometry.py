@@ -160,5 +160,101 @@ class TestDistanceAndFillet(unittest.TestCase):
         self.assertAlmostEqual(G.min_profile_distance([A, B]), 1.0, delta=0.02)
         self.assertAlmostEqual(G.min_profile_distance([A, B]),
                                G.min_profile_distance([B, A]), places=6)  # order-independent
+
+
+class TestPatternStyles(unittest.TestCase):
+    """Every style must produce closed, arc-consistent loops and tab-safe chains."""
+    SLOT, GAP, TAB, FIL = 1.651, 0.2223, 0.3175, 0.0667
+    BEND = 6.0
+
+    def _assert_closed(self, profile, tol=1e-7):
+        for i, seg in enumerate(profile):
+            p_end = seg[2] if seg[0] == "line" else seg[6]
+            nxt = profile[(i + 1) % len(profile)]
+            p_start = nxt[1] if nxt[0] == "line" else nxt[5]
+            d = math.hypot(p_end.x - p_start.x, p_end.y - p_start.y)
+            self.assertLess(d, tol, f"open loop between segments {i} and {i + 1}")
+
+    def _assert_arcs_consistent(self, profile, tol=1e-6):
+        for i, seg in enumerate(profile):
+            if seg[0] != "arc":
+                continue
+            _, c, r, a0, a1, p0, p1 = seg
+            e0 = math.hypot(c.x + r * math.cos(a0) - p0.x, c.y + r * math.sin(a0) - p0.y)
+            e1 = math.hypot(c.x + r * math.cos(a1) - p1.x, c.y + r * math.sin(a1) - p1.y)
+            self.assertLess(e0, tol, f"arc {i}: start point off circle")
+            self.assertLess(e1, tol, f"arc {i}: end point off circle")
+
+    def test_every_style_closed_and_consistent(self):
+        for style in G.PATTERN_STYLES:
+            for orient in (+1, -1):
+                cell = G.build_cell(style, self.SLOT, self.GAP, self.FIL,
+                                    orient=orient, cx=1.5, cy=-0.7)
+                self._assert_closed(cell)
+                self._assert_arcs_consistent(cell)
+
+    def test_every_style_pattern_respects_tab(self):
+        for style in G.PATTERN_STYLES:
+            pat = G.generate_pattern(self.BEND, self.GAP, self.TAB, self.SLOT,
+                                     self.FIL, style=style)
+            self.assertGreaterEqual(pat["count"], 1, style)
+            self.assertEqual(pat["style"], style)
+            if pat["count"] > 1:
+                self.assertGreaterEqual(pat["min_ligament"], self.TAB - 1e-6, style)
+
+    def test_alternating_styles_flip_orientation(self):
+        # Consecutive wave/zigzag/serpentine cells mirror in v: their bboxes'
+        # v-extents must differ; slot/diamond repeat identically.
+        for style in G.PATTERN_STYLES:
+            pat = G.generate_pattern(self.BEND, self.GAP, self.TAB, self.SLOT,
+                                     self.FIL, style=style)
+            if pat["count"] < 2:
+                continue
+            b0 = G._bbox(G.sample_profile(pat["profiles"][0]))
+            b1 = G._bbox(G.sample_profile(pat["profiles"][1]))
+            if G.style_alternates(style):
+                self.assertAlmostEqual(b0[1], -b1[3], places=6, msg=style)
+            else:
+                self.assertAlmostEqual(b0[1], b1[1], places=6, msg=style)
+                self.assertAlmostEqual(b0[3], b1[3], places=6, msg=style)
+
+    def test_cells_center_on_bend_line(self):
+        # Every style's cell must straddle v=0 (the bend line runs through it).
+        for style in G.PATTERN_STYLES:
+            cell = G.build_cell(style, self.SLOT, self.GAP, self.FIL)
+            _, ymin, _, ymax = G._bbox(G.sample_profile(cell))
+            self.assertLess(ymin, 0.0, style)
+            self.assertGreater(ymax, 0.0, style)
+
+    def test_slot_cell_dimensions(self):
+        cell = G.build_slot_cell(self.SLOT, self.GAP)
+        xmin, ymin, xmax, ymax = G._bbox(G.sample_profile(cell))
+        self.assertAlmostEqual(xmax - xmin, self.SLOT, places=6)
+        self.assertAlmostEqual(ymax - ymin, self.GAP, places=6)
+
+    def test_diamond_cell_dimensions(self):
+        cell = G.build_diamond_cell(self.SLOT, self.GAP, self.FIL)
+        xmin, ymin, xmax, ymax = G._bbox(G.sample_profile(cell))
+        self.assertAlmostEqual(ymax - ymin, 2.0 * self.GAP, delta=0.01)
+        self.assertLessEqual(xmax - xmin, self.SLOT + 1e-9)   # fillets pull the tips in
+
+    def test_infeasible_inputs_raise(self):
+        with self.assertRaises(ValueError):
+            G.build_slot_cell(self.GAP, self.GAP)              # too short for a pill
+        with self.assertRaises(ValueError):
+            G.build_serpentine_cell(1.9 * self.GAP, self.GAP)  # lobes would vanish
+        with self.assertRaises(ValueError):
+            G.build_diamond_cell(self.SLOT, self.GAP, self.GAP * 3)  # fillet > tips
+        with self.assertRaises(ValueError):
+            G.build_cell('nonsense', self.SLOT, self.GAP, self.FIL)
+
+    def test_cell_halfwidth_matches_probe(self):
+        for style in G.PATTERN_STYLES:
+            hw = G.cell_halfwidth(style, self.SLOT, self.GAP, self.FIL)
+            xmin, _, xmax, _ = G._bbox(G.sample_profile(
+                G.build_cell(style, self.SLOT, self.GAP, self.FIL)))
+            self.assertAlmostEqual(hw, (xmax - xmin) / 2.0, delta=0.02, msg=style)
+
+
 if __name__ == "__main__":
     unittest.main()
