@@ -218,12 +218,27 @@ STYLE_SLOT = 'slot'
 STYLE_ZIGZAG = 'zigzag'
 STYLE_DIAMOND = 'diamond'
 STYLE_SERPENTINE = 'serpentine'
+STYLE_CRESCENT = 'crescent'
+STYLE_DOGBONE = 'dogbone'
+STYLE_STAGGER = 'stagger'
+STYLE_MEANDER = 'meander'
 PATTERN_STYLES = (STYLE_WAVE, STYLE_SLOT, STYLE_ZIGZAG, STYLE_DIAMOND,
-                  STYLE_SERPENTINE)
+                  STYLE_SERPENTINE, STYLE_CRESCENT, STYLE_DOGBONE,
+                  STYLE_STAGGER, STYLE_MEANDER)
 
 # Styles whose consecutive cells flip orientation (up/down) along the chain.
+# 'stagger' flips ROWS: the pill jumps to the other side of the bend line, which
+# is exactly the staggered double-row living hinge.
 _ALTERNATING = {STYLE_WAVE: True, STYLE_SLOT: False, STYLE_ZIGZAG: True,
-                STYLE_DIAMOND: False, STYLE_SERPENTINE: True}
+                STYLE_DIAMOND: False, STYLE_SERPENTINE: True,
+                STYLE_CRESCENT: True, STYLE_DOGBONE: False,
+                STYLE_STAGGER: True, STYLE_MEANDER: True}
+
+# Research-backed shape constants (docs/pattern-research.md):
+CRESCENT_SAGITTA_RATIO = 0.2     # arc depth / chord — shallow arc, large radius
+DOGBONE_HOLE_RADIUS_X_GAP = 1.25  # end-hole radius = 1.25 x kerf (dia 2.5 x kerf)
+STAGGER_JOG_X_GAP = 0.5          # row offset from the bend line, in gaps
+MEANDER_AMPLITUDE_RATIO = 0.3    # meander half-height / slot_len
 
 
 def style_alternates(style):
@@ -363,6 +378,121 @@ def build_serpentine_cell(slot_len, gap, orient=+1, cx=0.0, cy=0.0):
     return _orient_translate(segs, orient, cx, cy)
 
 
+def build_crescent_cell(slot_len, gap, orient=+1, cx=0.0, cy=0.0):
+    """Crescent: one shallow arc slit of width gap (US 7,032,426: arcuate slits,
+    convex side toward the bend line, enlarged-radius profile resists cracking).
+    Chord = slot_len, sagitta = CRESCENT_SAGITTA_RATIO x chord; the cell is
+    vertically centered on the bend line and alternates bulge direction."""
+    if gap <= 0 or slot_len <= 0:
+        raise ValueError("gap and slot_len must be positive")
+    s = CRESCENT_SAGITTA_RATIO * slot_len
+    c2 = slot_len / 2.0
+    R = (c2 * c2 + s * s) / (2.0 * s)             # circumradius of the spine arc
+    g2 = gap / 2.0
+    if R - g2 <= 0.05 * gap:
+        raise ValueError("slot_len too short for a crescent (needs > ~0.8 x gap)")
+    # Spine: midpoint at (0, -s/2), endpoints at (+-c2, +s/2); center above.
+    Cn = Pt(0.0, R - s / 2.0)
+    alpha = math.asin(min(1.0, c2 / R))
+    a_mid = -math.pi / 2.0                        # bottom of the circle
+    a_l, a_r = a_mid - alpha, a_mid + alpha
+    r_o, r_i = R + g2, R - g2                     # outer (lower) / inner boundaries
+    EL = Pt(Cn.x + R * math.cos(a_l), Cn.y + R * math.sin(a_l))   # left spine end
+    ER = Pt(Cn.x + R * math.cos(a_r), Cn.y + R * math.sin(a_r))   # right spine end
+    def on(rr, ang):
+        return Pt(Cn.x + rr * math.cos(ang), Cn.y + rr * math.sin(ang))
+    # End caps bulge outward along the spine tangents (midpoint away from the slit).
+    segs = [
+        ("arc", Cn, r_o, a_l, a_r, on(r_o, a_l), on(r_o, a_r)),
+        ("arc", ER, g2, a_r, a_r + math.pi, on(r_o, a_r), on(r_i, a_r)),
+        ("arc", Cn, r_i, a_r, a_l, on(r_i, a_r), on(r_i, a_l)),
+        ("arc", EL, g2, a_l + math.pi, a_l + 2.0 * math.pi,
+         on(r_i, a_l), on(r_o, a_l)),
+    ]
+    return _orient_translate(segs, orient, cx, cy)
+
+
+def build_dogbone_cell(slot_len, gap, cx=0.0, cy=0.0):
+    """Dogbone: a straight slot of width gap with enlarged round end holes
+    (radius DOGBONE_HOLE_RADIUS_X_GAP x gap). The enlarged openings cut peak
+    bend-line stress ~22% vs a plain slot (FEA, docs/pattern-research.md) and
+    resist micro-crack propagation (US 7,032,426). Symmetric about the line."""
+    if gap <= 0 or slot_len <= 0:
+        raise ValueError("gap and slot_len must be positive")
+    g2 = gap / 2.0
+    rh = DOGBONE_HOLE_RADIUS_X_GAP * gap
+    h = slot_len / 2.0 - rh                       # end-hole centers at +-h
+    q = math.sqrt(max(rh * rh - g2 * g2, 0.0))    # slot-edge / hole junction offset
+    if h <= q + 1e-9:
+        raise ValueError("slot_len too short for dogbone end holes "
+                         "(needs > ~4.8 x gap)")
+    beta = math.atan2(g2, q)
+    CL, CR = Pt(cx - h, cy), Pt(cx + h, cy)
+    jRB = Pt(cx + h - q, cy - g2)                 # right hole, bottom junction
+    jRT = Pt(cx + h - q, cy + g2)
+    jLB = Pt(cx - h + q, cy - g2)
+    jLT = Pt(cx - h + q, cy + g2)
+    return [
+        ("line", jLB, jRB),
+        ("arc", CR, rh, -math.pi + beta, math.pi - beta, jRB, jRT),
+        ("line", jRT, jLT),
+        ("arc", CL, rh, beta, 2.0 * math.pi - beta, jLT, jLB),
+    ]
+
+
+def build_stagger_cell(slot_len, gap, orient=+1, cx=0.0, cy=0.0):
+    """Staggered-row slot: a plain pill offset off the bend line by
+    STAGGER_JOG_X_GAP x gap; consecutive cells flip rows, forming the classic
+    two-row living hinge. The jog stays within the patent's preferred
+    <= 0.5 x thickness once gap is sized to ~1 x thickness (US 7,032,426)."""
+    jog = STAGGER_JOG_X_GAP * gap
+    return build_slot_cell(slot_len, gap, cx=cx, cy=cy + orient * jog)
+
+
+def build_meander_cell(slot_len, gap, fillet_r, orient=+1, cx=0.0, cy=0.0):
+    """Square meander: a constant-width squared-off arch (orient=+1 opens down,
+    -1 opens up) — the rectangular serpentine. Vertical ends, one horizontal
+    run, all four knees filleted (inner fillet_r, outer fillet_r + gap): the
+    FEA identifies small corner radii as THE fracture driver, so the fillets
+    are structural here, not cosmetic."""
+    if gap <= 0 or slot_len <= 0:
+        raise ValueError("gap and slot_len must be positive")
+    if fillet_r <= 0:
+        raise ValueError("fillet_r must be > 0 (sharp internal corners crack when bent)")
+    g2 = gap / 2.0
+    h2 = slot_len / 2.0
+    a = MEANDER_AMPLITUDE_RATIO * slot_len
+    r_in, r_out = fillet_r, fillet_r + gap
+    if 2.0 * r_out >= slot_len - 2.0 * g2 - 1e-9:
+        raise ValueError("fillet_r or gap too large for the meander top run")
+    if a <= r_out + g2 + 1e-9:
+        raise ValueError("slot_len too short for meander arms (needs > ~5 x gap)")
+    # Arch path: A(-h2,-a) up to B(-h2,+a), across to C(+h2,+a), down to D(+h2,-a).
+    Ao, Ai = Pt(-h2 - g2, -a), Pt(-h2 + g2, -a)   # outer / inner cap anchors, left
+    Do, Di = Pt(h2 + g2, -a), Pt(h2 - g2, -a)
+    Bo, Co = Pt(-h2 - g2, a + g2), Pt(h2 + g2, a + g2)   # outer knees
+    Bi, Ci = Pt(-h2 + g2, a - g2), Pt(h2 - g2, a - g2)   # inner knees
+    fBo = fillet_corner(Ao, Bo, Co, r_out)
+    fCo = fillet_corner(Bo, Co, Do, r_out)
+    fCi = fillet_corner(Di, Ci, Bi, r_in)
+    fBi = fillet_corner(Ci, Bi, Ai, r_in)
+    segs = [
+        ("line", Ao, fBo[0]),
+        ("arc", fBo[2], r_out, fBo[3], fBo[4], fBo[0], fBo[1]),
+        ("line", fBo[1], fCo[0]),
+        ("arc", fCo[2], r_out, fCo[3], fCo[4], fCo[0], fCo[1]),
+        ("line", fCo[1], Do),
+        ("arc", Pt(h2, -a), g2, 0.0, -math.pi, Do, Di),
+        ("line", Di, fCi[0]),
+        ("arc", fCi[2], r_in, fCi[3], fCi[4], fCi[0], fCi[1]),
+        ("line", fCi[1], fBi[0]),
+        ("arc", fBi[2], r_in, fBi[3], fBi[4], fBi[0], fBi[1]),
+        ("line", fBi[1], Ai),
+        ("arc", Pt(-h2, -a), g2, 0.0, -math.pi, Ai, Ao),
+    ]
+    return _orient_translate(segs, orient, cx, cy)
+
+
 def _orient_translate(segs, orient, cx, cy):
     """Mirror in v (orient=-1) then translate -- the same transform the wave applies."""
     s = 1.0 if orient >= 0 else -1.0
@@ -394,6 +524,14 @@ def build_cell(style, slot_len, gap, fillet_r, end_angle_deg=40.0, diag_len=0.48
         return build_diamond_cell(slot_len, gap, fillet_r, cx=cx, cy=cy)
     if style == STYLE_SERPENTINE:
         return build_serpentine_cell(slot_len, gap, orient=orient, cx=cx, cy=cy)
+    if style == STYLE_CRESCENT:
+        return build_crescent_cell(slot_len, gap, orient=orient, cx=cx, cy=cy)
+    if style == STYLE_DOGBONE:
+        return build_dogbone_cell(slot_len, gap, cx=cx, cy=cy)
+    if style == STYLE_STAGGER:
+        return build_stagger_cell(slot_len, gap, orient=orient, cx=cx, cy=cy)
+    if style == STYLE_MEANDER:
+        return build_meander_cell(slot_len, gap, fillet_r, orient=orient, cx=cx, cy=cy)
     raise ValueError(f"unknown pattern style: {style!r}")
 
 
@@ -409,10 +547,10 @@ def cell_halfwidth(style, slot_len, gap, fillet_r, end_angle_deg=40.0,
 # Tessellation: a single cell chain along the bend line
 # ---------------------------------------------------------------------------
 
-# Solver probe sampling (chords per segment). Serpentine's big lobe arcs need
-# finer chords to keep the sampling-error margin (and thus the safety padding
-# added to the solved pitch) small.
-_PROBE_N = {STYLE_SERPENTINE: 10}
+# Solver probe sampling (chords per segment). Styles with large-radius or
+# large-sweep arcs need finer chords to keep the sampling-error margin (and
+# thus the safety padding added to the solved pitch) small.
+_PROBE_N = {STYLE_SERPENTINE: 10, STYLE_CRESCENT: 10, STYLE_DOGBONE: 10}
 _FINAL_N = 12                     # generate_pattern's reporting density
 
 

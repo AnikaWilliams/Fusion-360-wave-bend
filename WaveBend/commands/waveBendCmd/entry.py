@@ -387,6 +387,9 @@ def _status_summary(inputs, results, warnings):
         slots, lines, _fmt(pitch), _fmt(min_lig))
     if tab < t - 1e-9:
         msg += '\nWarning: tab < thickness — the fold ligaments will be weak (rule: tab >= t)'
+    if t > config.MAX_RELIABLE_THICKNESS_CM + 1e-9:
+        msg += ('\nWarning: thickness over 3 mm — hand-bend relief patterns risk '
+                'cracking at this gauge (see docs/pattern-research.md)')
     for w in warnings:
         msg += f'\nWarning: {w}'
     return msg
@@ -587,11 +590,12 @@ def _reseed_from_body(inputs):
 
 
 def _reseed_derived(inputs):
-    """thickness/material changed: re-derive whichever of gap/tab/fillet are auto."""
+    """thickness/material/style changed: re-derive whichever of gap/tab/fillet
+    are auto. The gap default is style-aware (research kerf floors)."""
     t = inputs.itemById('thickness').value
     dd = inputs.itemById('material').selectedItem
     mat = dd.name if dd else config.FAMILY_ALUMINUM
-    gap = config.default_gap_cm(t, mat)
+    gap = config.default_gap_cm(t, mat, style=_style(inputs))
     if _auto['gap']:
         inputs.itemById('gap').value = gap
     if _auto['tab']:
@@ -672,7 +676,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         elif cid in ('thickness', 'material'):
             _reseed_derived(inputs)
             _refresh_count(inputs)
-        elif cid in ('gap', 'tab', 'fillet', 'slotLen', 'patternStyle'):
+        elif cid == 'patternStyle':
+            _reseed_derived(inputs)       # style-aware kerf floor (auto gap only)
+            _refresh_count(inputs)
+        elif cid in ('gap', 'tab', 'fillet', 'slotLen'):
             _refresh_count(inputs)
         elif cid == 'slotCount':
             _slot_from_count(inputs)          # last-edited-wins: do NOT recompute count
@@ -899,11 +906,12 @@ def _rebuild_feature(design, attr, payload):
             family = now['family'] or stored_family or config.FAMILY_ALUMINUM
         else:
             family = stored_family or config.FAMILY_ALUMINUM
-        gap = (config.default_gap_cm(t, family) if auto.get('gap', True) else params['gap'])
+        style = params.get('style', config.DEFAULT_PATTERN_STYLE)
+        gap = (config.default_gap_cm(t, family, style=style)
+               if auto.get('gap', True) else params['gap'])
         tab = (config.default_tab_cm(t) if auto.get('tab', True) else params['tab'])
         fil = (config.default_fillet_cm(gap) if auto.get('fillet', True) else params['fil'])
         slot = params['slot']
-        style = params.get('style', config.DEFAULT_PATTERN_STYLE)
 
         # Validate the new pattern BEFORE touching the old feature.
         frame = FB.frame_from_points(*line_geom)

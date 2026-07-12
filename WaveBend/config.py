@@ -19,12 +19,32 @@ DEFAULT_DIAG_LEN_CM = 0.4826  # ~0.19 in: swept diagonal end length, constant ac
 # (geometry style key, dialog label). Keys match geometry.PATTERN_STYLES.
 PATTERN_STYLE_LABELS = (
     ('wave', 'Wave (SendCutSend)'),
-    ('slot', 'Straight slots'),
-    ('zigzag', 'Zigzag'),
-    ('diamond', 'Diamond'),
+    ('crescent', 'Crescent arcs'),
     ('serpentine', 'Serpentine'),
+    ('meander', 'Square meander'),
+    ('zigzag', 'Zigzag'),
+    ('dogbone', 'Dogbone slots'),
+    ('stagger', 'Staggered slots'),
+    ('slot', 'Straight slots'),
+    ('diamond', 'Diamond'),
 )
 DEFAULT_PATTERN_STYLE = 'wave'
+
+# Per-style kerf floors, in material thicknesses (docs/pattern-research.md):
+# curved profiles are fracture-safe at any practical kerf, so they use the
+# family multiplier as-is; dogbones are safe from 0.7 t (the enlarged end
+# holes carry the stress); straight-slot geometries want a full 1.0 t.
+STYLE_GAP_FLOOR_X_T = {
+    'dogbone': 0.7,
+    'stagger': 1.0,
+    'slot': 1.0,
+    'meander': 1.0,
+    'diamond': 1.0,
+}
+
+# Hand-bend relief patterns get unreliable above ~3 mm: SendCutSend caps wave
+# bending at 0.187 in, and fracture is predicted at 3.2 mm in the 6061-O FEA.
+MAX_RELIABLE_THICKNESS_CM = 0.3
 
 
 def pattern_style_for_label(label):
@@ -96,8 +116,13 @@ def material_family(name):
         return FAMILY_STAINLESS
     return None
 
-def default_gap_cm(t_cm, material_name):
-    return t_cm * gap_multiplier_for(material_name)
+def default_gap_cm(t_cm, material_name, style=DEFAULT_PATTERN_STYLE):
+    """Kerf default: family multiplier, raised to the style's research floor."""
+    gap = t_cm * gap_multiplier_for(material_name)
+    floor = STYLE_GAP_FLOOR_X_T.get(style)
+    if floor:
+        gap = max(gap, t_cm * floor)
+    return gap
 
 def default_tab_cm(t_cm):
     return t_cm

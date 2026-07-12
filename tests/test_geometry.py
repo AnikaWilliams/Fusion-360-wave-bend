@@ -219,8 +219,20 @@ class TestPatternStyles(unittest.TestCase):
                 self.assertAlmostEqual(b0[3], b1[3], places=6, msg=style)
 
     def test_cells_center_on_bend_line(self):
-        # Every style's cell must straddle v=0 (the bend line runs through it).
+        # Every style's cell must straddle v=0 (the bend line runs through it) —
+        # except stagger, whose cells sit on alternating SIDES of the line and
+        # must straddle it as a +1/-1 pair.
         for style in G.PATTERN_STYLES:
+            if style == G.STYLE_STAGGER:
+                up = G._bbox(G.sample_profile(G.build_cell(style, self.SLOT,
+                                                           self.GAP, self.FIL, orient=+1)))
+                dn = G._bbox(G.sample_profile(G.build_cell(style, self.SLOT,
+                                                           self.GAP, self.FIL, orient=-1)))
+                self.assertGreaterEqual(up[1], -1e-9, style)   # above (or touching)
+                self.assertLessEqual(dn[3], 1e-9, style)       # below (or touching)
+                self.assertGreater(up[3], 0.0, style)
+                self.assertLess(dn[1], 0.0, style)
+                continue
             cell = G.build_cell(style, self.SLOT, self.GAP, self.FIL)
             _, ymin, _, ymax = G._bbox(G.sample_profile(cell))
             self.assertLess(ymin, 0.0, style)
@@ -246,7 +258,42 @@ class TestPatternStyles(unittest.TestCase):
         with self.assertRaises(ValueError):
             G.build_diamond_cell(self.SLOT, self.GAP, self.GAP * 3)  # fillet > tips
         with self.assertRaises(ValueError):
+            G.build_dogbone_cell(4.0 * self.GAP, self.GAP)     # no room for end holes
+        with self.assertRaises(ValueError):
+            G.build_meander_cell(4.0 * self.GAP, self.GAP, self.FIL)  # arms too short
+        with self.assertRaises(ValueError):
             G.build_cell('nonsense', self.SLOT, self.GAP, self.FIL)
+
+    def test_dogbone_dimensions(self):
+        cell = G.build_dogbone_cell(self.SLOT, self.GAP)
+        xmin, ymin, xmax, ymax = G._bbox(G.sample_profile(cell, n=24))
+        self.assertAlmostEqual(xmax - xmin, self.SLOT, delta=0.01)
+        # end holes: total height = 2 x hole radius = 2 x 1.25 x gap
+        self.assertAlmostEqual(ymax - ymin,
+                               2.0 * G.DOGBONE_HOLE_RADIUS_X_GAP * self.GAP,
+                               delta=0.01)
+
+    def test_stagger_rows_offset_by_jog(self):
+        jog = G.STAGGER_JOG_X_GAP * self.GAP
+        up = G._bbox(G.sample_profile(G.build_stagger_cell(self.SLOT, self.GAP,
+                                                           orient=+1)))
+        dn = G._bbox(G.sample_profile(G.build_stagger_cell(self.SLOT, self.GAP,
+                                                           orient=-1)))
+        self.assertAlmostEqual((up[1] + up[3]) / 2.0, jog, places=6)
+        self.assertAlmostEqual((dn[1] + dn[3]) / 2.0, -jog, places=6)
+
+    def test_crescent_is_all_arcs_and_shallow(self):
+        cell = G.build_crescent_cell(self.SLOT, self.GAP)
+        self.assertTrue(all(seg[0] == "arc" for seg in cell))
+        _, ymin, _, ymax = G._bbox(G.sample_profile(cell, n=24))
+        exp_h = G.CRESCENT_SAGITTA_RATIO * self.SLOT + self.GAP
+        self.assertAlmostEqual(ymax - ymin, exp_h, delta=0.02)
+
+    def test_meander_dimensions(self):
+        cell = G.build_meander_cell(self.SLOT, self.GAP, self.FIL)
+        _, ymin, _, ymax = G._bbox(G.sample_profile(cell, n=12))
+        exp_h = 2.0 * G.MEANDER_AMPLITUDE_RATIO * self.SLOT + self.GAP
+        self.assertAlmostEqual(ymax - ymin, exp_h, delta=0.02)
 
     def test_cell_halfwidth_matches_probe(self):
         for style in G.PATTERN_STYLES:

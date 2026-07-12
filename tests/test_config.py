@@ -39,5 +39,35 @@ class TestMaterialFamily(unittest.TestCase):
         self.assertIsNone(config.material_family(""))
         self.assertIsNone(config.material_family(None))
 
+
+class TestStyleGapFloors(unittest.TestCase):
+    """Research kerf floors (docs/pattern-research.md): curved styles keep the
+    family multiplier; dogbone floors at 0.7 t; straight-slot styles at 1.0 t."""
+    T = 0.3175
+
+    def test_curved_styles_keep_family_multiplier(self):
+        for style in ("wave", "crescent", "serpentine", "zigzag"):
+            self.assertAlmostEqual(
+                config.default_gap_cm(self.T, "Aluminum", style=style),
+                self.T * 0.6, places=9, msg=style)
+
+    def test_dogbone_floor_raises_aluminum_only(self):
+        self.assertAlmostEqual(config.default_gap_cm(self.T, "Aluminum", style="dogbone"),
+                               self.T * 0.7, places=9)
+        self.assertAlmostEqual(config.default_gap_cm(self.T, "Mild Steel", style="dogbone"),
+                               self.T * 0.7, places=9)
+
+    def test_straight_slot_styles_floor_at_full_thickness(self):
+        for style in ("stagger", "slot", "meander", "diamond"):
+            for family in ("Aluminum", "Mild Steel", "Stainless Steel"):
+                self.assertAlmostEqual(
+                    config.default_gap_cm(self.T, family, style=style),
+                    self.T * 1.0, places=9, msg=f"{style}/{family}")
+
+    def test_default_style_is_backward_compatible(self):
+        self.assertAlmostEqual(config.default_gap_cm(self.T, "Aluminum"),
+                               self.T * 0.6, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()
