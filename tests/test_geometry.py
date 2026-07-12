@@ -302,6 +302,24 @@ class TestPatternStyles(unittest.TestCase):
                 G.build_cell(style, self.SLOT, self.GAP, self.FIL)))
             self.assertAlmostEqual(hw, (xmax - xmin) / 2.0, delta=0.02, msg=style)
 
+    def test_min_slot_len_is_buildable_for_every_style(self):
+        # A slot AT the reported floor must build; just below it must fail. This
+        # is what lets the dialog auto-lengthen instead of erroring.
+        for gap, fil in ((self.GAP, self.FIL), (0.3175, 0.0953), (0.1, 0.03)):
+            for style in G.PATTERN_STYLES:
+                floor = G.min_slot_len(style, gap, fil)
+                try:
+                    G.build_cell(style, floor, gap, fil)     # at the floor: OK
+                except ValueError as e:
+                    self.fail(f"{style} failed to build at min_slot_len: {e}")
+
+    def test_meander_floor_exceeds_default_when_gap_is_wide(self):
+        # The reported infeasibility case: wide gap (1 t) + default-ish slot.
+        gap, fil = 0.3175, 0.0953
+        self.assertGreater(G.min_slot_len(G.STYLE_MEANDER, gap, fil), 1.651)
+        # and the wave (fillet-limited) stays short
+        self.assertLess(G.min_slot_len(G.STYLE_WAVE, gap, fil), 1.651)
+
 
 if __name__ == "__main__":
     unittest.main()

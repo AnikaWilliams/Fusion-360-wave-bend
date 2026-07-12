@@ -605,6 +605,20 @@ def _reseed_derived(inputs):
             inputs.itemById('gap').value)
 
 
+def _apply_slot_floor(inputs):
+    """Auto-lengthen the slot to the shortest the current style can build (the
+    meander's squared arms need clearance the wave doesn't). Only ever raises
+    the value, so a valid user slot is left untouched. Returns True if changed."""
+    style = _style(inputs)
+    gap = inputs.itemById('gap').value
+    fil = inputs.itemById('fillet').value
+    floor = G.min_slot_len(style, gap, fil)
+    if inputs.itemById('slotLen').value < floor - 1e-9:
+        inputs.itemById('slotLen').value = floor
+        return True
+    return False
+
+
 def _refresh_count(inputs):
     """slot length (or upstream parameter) changed: recompute the count display."""
     B = _bend_len(inputs)
@@ -646,7 +660,7 @@ def _slot_from_count(inputs):
                                 config.DEFAULT_DIAG_LEN_CM) - slot_now + 2.0 * gap)
     q = max(count - 0.5, 0.5)
     slot = (B - K - q * C) / (q + 1.0)
-    min_slot = max(4.0 * fil, 0.2, 2.3 * gap)          # serpentine/slot/diamond floors
+    min_slot = G.min_slot_len(style, gap, fil)         # style-specific buildable floor
     if slot < min_slot:
         futil.log(f'{CMD_NAME}: {count} slots need slot_len<{min_slot:.2f} cm; clamped')
         slot = min_slot
@@ -675,11 +689,16 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             _refresh_count(inputs)
         elif cid in ('thickness', 'material'):
             _reseed_derived(inputs)
+            _apply_slot_floor(inputs)     # gap moved -> the buildable floor moved
             _refresh_count(inputs)
         elif cid == 'patternStyle':
             _reseed_derived(inputs)       # style-aware kerf floor (auto gap only)
+            _apply_slot_floor(inputs)     # auto-lengthen slot for e.g. the meander
             _refresh_count(inputs)
-        elif cid in ('gap', 'tab', 'fillet', 'slotLen'):
+        elif cid in ('gap', 'fillet'):
+            _apply_slot_floor(inputs)     # floor depends on gap/fillet
+            _refresh_count(inputs)
+        elif cid in ('tab', 'slotLen'):
             _refresh_count(inputs)
         elif cid == 'slotCount':
             _slot_from_count(inputs)          # last-edited-wins: do NOT recompute count
@@ -911,7 +930,9 @@ def _rebuild_feature(design, attr, payload):
                if auto.get('gap', True) else params['gap'])
         tab = (config.default_tab_cm(t) if auto.get('tab', True) else params['tab'])
         fil = (config.default_fillet_cm(gap) if auto.get('fillet', True) else params['fil'])
-        slot = params['slot']
+        # A gap-widening material change can push the stored slot below what the
+        # style can build (e.g. the meander) — auto-lengthen so the rebuild holds.
+        slot = max(params['slot'], G.min_slot_len(style, gap, fil))
 
         # Validate the new pattern BEFORE touching the old feature.
         frame = FB.frame_from_points(*line_geom)

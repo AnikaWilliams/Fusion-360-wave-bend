@@ -543,6 +543,32 @@ def cell_halfwidth(style, slot_len, gap, fillet_r, end_angle_deg=40.0,
     return (max(p.x for p in probe) - min(p.x for p in probe)) / 2.0
 
 
+def min_slot_len(style, gap, fillet_r):
+    """Smallest slot_len that yields a BUILDABLE cell for `style`, plus a small
+    margin. Each floor mirrors the feasibility check in that style's builder, so
+    the dialog can auto-lengthen the slot instead of erroring. Fillet-limited
+    styles (wave, zigzag, diamond) fall through to the generic 4 x fillet floor."""
+    base = max(4.0 * fillet_r, 0.2)
+    if style in (STYLE_SLOT, STYLE_STAGGER):
+        return max(base, 1.55 * gap)             # build_slot_cell: slot > 1.5 x gap
+    if style == STYLE_DIAMOND:
+        return max(base, 2.05 * gap)             # build_diamond_cell: slot > 2 x gap
+    if style == STYLE_SERPENTINE:
+        return max(base, 2.25 * gap)             # R - g2 >= ~0.05 x gap
+    if style == STYLE_CRESCENT:
+        return max(base, 0.85 * gap)             # R - g2 > ~0.05 x gap
+    if style == STYLE_DOGBONE:
+        rh = DOGBONE_HOLE_RADIUS_X_GAP * gap
+        q = math.sqrt(max(rh * rh - (gap / 2.0) ** 2, 0.0))
+        return max(base, 2.0 * (rh + q) * 1.02)  # h > q: slot > 2(rh+q)
+    if style == STYLE_MEANDER:
+        r_out = fillet_r + gap
+        floor_arms = (r_out + gap / 2.0) / MEANDER_AMPLITUDE_RATIO  # a > r_out+g2
+        floor_top = 2.0 * r_out + gap                                # top run fits
+        return max(base, floor_arms, floor_top) * 1.02
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Tessellation: a single cell chain along the bend line
 # ---------------------------------------------------------------------------
