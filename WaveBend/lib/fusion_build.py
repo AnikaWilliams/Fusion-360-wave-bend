@@ -51,7 +51,13 @@ _MIN_SEG_CM = 1e-4   # skip sketch lines shorter than this (defensive against de
 
 
 def draw_pattern_sketch(comp, pattern, frame):
-    """Draw every cell profile into ONE new sketch on the frame's face. Returns the sketch.
+    """Draw one pattern into ONE new sketch on the frame's face. Returns the sketch."""
+    return draw_patterns_sketch(comp, [(pattern, frame)])
+
+
+def draw_patterns_sketch(comp, pattern_frame_pairs):
+    """Draw SEVERAL patterns -- each with its own frame, all frames on the SAME
+    planar face -- into ONE new sketch. Returns the sketch.
 
     IMPORTANT: Fusion sketch entities live in the SKETCH's local coordinate system,
     not model space -- a face sketch has its own origin/axes (and often a flipped
@@ -59,7 +65,7 @@ def draw_pattern_sketch(comp, pattern, frame):
     selected bend line. Every point is therefore mapped model->sketch via
     Sketch.modelToSketchSpace().
     """
-    origin, u_hat, v_hat, _length, face = frame
+    face = pattern_frame_pairs[0][1][4]
     sk = comp.sketches.add(face)                       # (verify: sketches.add(planarFace))
     try:
         # Defer sketch compute while bulk-editing: every add/delete otherwise
@@ -77,25 +83,28 @@ def draw_pattern_sketch(comp, pattern, frame):
             except Exception:
                 pass                                   # locked/undeletable refs: leave them
 
-        def sp(u, v):
-            # local (u,v) -> model Point3D -> THIS sketch's coordinates (verify: modelToSketchSpace)
-            return sk.modelToSketchSpace(_pt3d(origin, u_hat, v_hat, u, v))
-
         lines = sk.sketchCurves.sketchLines
         arcs = sk.sketchCurves.sketchArcs
-        for profile in pattern["profiles"]:
-            for seg in profile:
-                if seg[0] == "line":
-                    _, a, b = seg
-                    if math.hypot(b.x - a.x, b.y - a.y) < _MIN_SEG_CM:
-                        continue                       # adjacent arcs already meet; skip the stub
-                    lines.addByTwoPoints(sp(a.x, a.y), sp(b.x, b.y))
-                else:
-                    _, c, r, a0, a1, a, b = seg
-                    am = (a0 + a1) / 2.0
-                    mid = G.Pt(c.x + r * math.cos(am), c.y + r * math.sin(am))
-                    arcs.addByThreePoints(             # (verify: addByThreePoints)
-                        sp(a.x, a.y), sp(mid.x, mid.y), sp(b.x, b.y))
+        for pattern, frame in pattern_frame_pairs:
+            origin, u_hat, v_hat, _length, _face = frame
+
+            def sp(u, v):
+                # local (u,v) -> model Point3D -> THIS sketch's coordinates
+                return sk.modelToSketchSpace(_pt3d(origin, u_hat, v_hat, u, v))
+
+            for profile in pattern["profiles"]:
+                for seg in profile:
+                    if seg[0] == "line":
+                        _, a, b = seg
+                        if math.hypot(b.x - a.x, b.y - a.y) < _MIN_SEG_CM:
+                            continue                   # adjacent arcs already meet; skip the stub
+                        lines.addByTwoPoints(sp(a.x, a.y), sp(b.x, b.y))
+                    else:
+                        _, c, r, a0, a1, a, b = seg
+                        am = (a0 + a1) / 2.0
+                        mid = G.Pt(c.x + r * math.cos(am), c.y + r * math.sin(am))
+                        arcs.addByThreePoints(         # (verify: addByThreePoints)
+                            sp(a.x, a.y), sp(mid.x, mid.y), sp(b.x, b.y))
     finally:
         # ALWAYS resume compute -- profiles are only valid once the sketch solves,
         # and cut_sketch reads sk.profiles right after this returns.
@@ -135,18 +144,25 @@ def cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=None):
 
 
 def draw_and_cut(comp, pattern, frame, depth_cm, name=None):
-    """Draw the pattern sketch, then cut it. Returns (sketch, cut_feature).
+    """Draw one pattern's sketch, then cut it. Returns (sketch, cut_feature)."""
+    return draw_and_cut_multi(comp, [(pattern, frame)], depth_cm, name=name)
+
+
+def draw_and_cut_multi(comp, pattern_frame_pairs, depth_cm, name=None):
+    """Draw SEVERAL patterns (same face) into ONE sketch, then ONE cut consuming
+    all their slot profiles. Returns (sketch, cut_feature).
 
     If `name` is given, both timeline features get readable names instead of
     the anonymous 'SketchN' / 'ExtrudeN'."""
-    sk = draw_pattern_sketch(comp, pattern, frame)
+    sk = draw_patterns_sketch(comp, pattern_frame_pairs)
     # slot-size ceiling for the profile filter: the largest cell bbox diagonal + slack
     diag = 0.0
-    for prof in pattern["profiles"][:2]:               # smile + frown suffice
-        pts = G.sample_profile(prof, n=4)
-        w = max(p.x for p in pts) - min(p.x for p in pts)
-        h = max(p.y for p in pts) - min(p.y for p in pts)
-        diag = max(diag, math.hypot(w, h))
+    for pattern, _frame in pattern_frame_pairs:
+        for prof in pattern["profiles"][:2]:           # smile + frown suffice
+            pts = G.sample_profile(prof, n=4)
+            w = max(p.x for p in pts) - min(p.x for p in pts)
+            h = max(p.y for p in pts) - min(p.y for p in pts)
+            diag = max(diag, math.hypot(w, h))
     cut = cut_sketch(comp, sk, depth_cm, max_profile_diag_cm=diag * 1.2)
     if name:
         try:

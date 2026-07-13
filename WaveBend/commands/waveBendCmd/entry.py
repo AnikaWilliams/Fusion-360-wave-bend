@@ -21,6 +21,8 @@ CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_waveBend'
 # Hidden helper command: CustomFeatures.add is refused outside a command's execute
 # context (and inside previews), so post-commit wrapping runs via this command.
 WRAP_CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_wrapPending'
+# Edit command: what Fusion runs on right-click > Edit Feature on our timeline node.
+EDIT_CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_waveBendEdit'
 CMD_NAME = 'Wave Bend'
 CMD_Description = ('Cut a SendCutSend-style wave relief pattern along selected bend '
                    'lines so the flat part can be folded by hand.')
@@ -37,7 +39,7 @@ LOG_PATH = os.path.join(_REPO, 'last_run.log')
 
 ATTR_GROUP = 'WaveBend'
 ATTR_NAME = 'feature'
-ATTR_VERSION = 1
+ATTR_VERSION = 2          # v2: payload carries a LIST of bend lines per feature
 
 local_handlers = []
 
@@ -263,15 +265,16 @@ def _wrap_custom_feature(comp, sk, cut, name):
     return ''
 
 
-def _tag_feature(cut, sk, line_geom, body, params, custom_token=''):
-    """Persist everything the watcher needs to rebuild this cut later.
+def _tag_feature(cut, sk, lines, body, params, custom_token=''):
+    """Persist everything the watcher/editor needs to rebuild this feature later.
 
-    The bend line is stored as raw endpoint COORDINATES (line_geom) — entity
-    tokens proved unstable across preview rollbacks (they can remap to sibling
-    sketch lines), and coordinates survive anything."""
+    `lines` is a LIST of bend lines, each stored as raw endpoint COORDINATES
+    ((x0,y0,z0),(x1,y1,z1)) — entity tokens proved unstable across preview
+    rollbacks (they can remap to sibling sketch lines); coordinates survive
+    anything. One feature may carry several lines (one command run, one face)."""
     payload = {
         'version': ATTR_VERSION,
-        'line_geom': line_geom,                        # ((x0,y0,z0),(x1,y1,z1)) cm
+        'lines': list(lines),
         'sketch_token': sk.entityToken,
         'body_token': body.entityToken if body else '',
         'custom_token': custom_token,
@@ -280,6 +283,14 @@ def _tag_feature(cut, sk, line_geom, body, params, custom_token=''):
         'snapshot': _snapshot_for(body) if body else {},
     }
     cut.attributes.add(ATTR_GROUP, ATTR_NAME, json.dumps(payload))   # (verify: attributes.add)
+
+
+def _payload_lines(payload):
+    """Bend lines from a payload, tolerant of the v1 single-line format."""
+    if payload.get('lines'):
+        return payload['lines']
+    lg = payload.get('line_geom')
+    return [lg] if lg else []
 
 
 def _build(inputs, sketch_only=False):
@@ -329,28 +340,51 @@ def _build(inputs, sketch_only=False):
                       origin.z + u_hat.z * length))
         jobs.append((line_geom, body, pattern))
 
-    # ---- phase 2: build, isolated per line ----
+    # ---- phase 2: build, grouped by face — one command run produces ONE sketch,
+    # ONE cut and ONE custom feature per face (normally: exactly one node) ----
     results, failures, wrapped_all = [], [], True
-    for i, (line_geom, body, pattern) in enumerate(jobs):
+    pending = list(enumerate(jobs))
+    while pending:
+        # ALWAYS re-resolve frames from raw coordinates against CURRENT geometry:
+        # an earlier group's cut may have split/replaced faces, and coordinate
+        # lookup is immune to that.
+        resolved = []
+        for idx, (line_geom, body, pattern) in pending:
+            try:
+                resolved.append((idx, line_geom, body, pattern,
+                                 FB.frame_from_points(*line_geom)))
+            except Exception:
+                futil.log(f'{CMD_NAME}: line {idx + 1} failed:\n{traceback.format_exc()}')
+                failures.append(idx + 1)
+        if not resolved:
+            break
+        face_token = resolved[0][4][4].entityToken
+        group = [r for r in resolved if r[4][4].entityToken == face_token]
+        group_ids = {r[0] for r in group}
+        pending = [(idx, jobs[idx]) for (idx, *_rest) in resolved
+                   if idx not in group_ids]
         sk = None
         try:
-            # ALWAYS re-resolve the frame from raw coordinates: an earlier cut may
-            # have split/replaced the face, and coordinate lookup is immune to that.
-            frame = FB.frame_from_points(*line_geom)
-            name = _feature_name(style, pattern["count"])
+            pairs = [(pattern, frame) for _i, _lg, _b, pattern, frame in group]
+            total = sum(p['count'] for p, _f in pairs)
+            name = _feature_name(style, total, len(pairs))
             if sketch_only:
-                FB.draw_pattern_sketch(comp, pattern, frame)
-                results.append({'pattern': pattern, 'cut': None, 'wrapped': False})
+                FB.draw_patterns_sketch(comp, pairs)
+                for _i, _lg, _b, pattern, _f in group:
+                    results.append({'pattern': pattern, 'cut': None, 'wrapped': False})
                 continue
-            sk, cut = FB.draw_and_cut(comp, pattern, frame, t, name=name)
+            sk, cut = FB.draw_and_cut_multi(comp, pairs, t, name=name)
             cf_token = _wrap_custom_feature(comp, sk, cut, name)
             if not cf_token:
                 wrapped_all = False
-            _tag_feature(cut, sk, line_geom, body, params, custom_token=cf_token)
-            results.append({'pattern': pattern, 'cut': cut, 'wrapped': bool(cf_token)})
+            lines = [lg for _i, lg, _b, _p, _f in group]
+            _tag_feature(cut, sk, lines, group[0][2], params, custom_token=cf_token)
+            for _i, _lg, _b, pattern, _f in group:
+                results.append({'pattern': pattern, 'cut': cut, 'wrapped': bool(cf_token)})
         except Exception:
-            futil.log(f'{CMD_NAME}: line {i + 1} failed:\n{traceback.format_exc()}')
-            failures.append(i + 1)
+            futil.log(f'{CMD_NAME}: group of {len(group)} line(s) failed:\n'
+                      f'{traceback.format_exc()}')
+            failures.extend(i + 1 for i in sorted(group_ids))
             if sk is not None:
                 try:
                     sk.deleteMe()                      # never leave an orphan sketch behind
@@ -375,11 +409,12 @@ def _build(inputs, sketch_only=False):
     return results, warnings
 
 
-def _feature_name(style, count):
+def _feature_name(style, count, nlines=1):
     """Timeline node name; the style is called out for everything but the classic wave."""
+    where = f'{count} slots' if nlines <= 1 else f'{count} slots, {nlines} lines'
     if style == config.DEFAULT_PATTERN_STYLE:
-        return f'Wave Bend ({count} slots)'
-    return f'Wave Bend ({config.pattern_label_for_style(style)}, {count} slots)'
+        return f'Wave Bend ({where})'
+    return f'Wave Bend ({config.pattern_label_for_style(style)}, {where})'
 
 
 def _status_summary(inputs, results, warnings):
@@ -449,12 +484,24 @@ def start():
     # clear_handlers() alone leaves a zombie watcher alive across reloads.
     global _watcher_handler
     _watcher_handler = futil.add_handler(ui.commandTerminated, on_command_terminated)
+    # The edit command (no button): Fusion invokes it for right-click > Edit
+    # Feature / double-click on our timeline nodes via editCommandId below.
+    stale_edit = ui.commandDefinitions.itemById(EDIT_CMD_ID)
+    if stale_edit:
+        try:
+            stale_edit.deleteMe()
+        except Exception:
+            pass
+    edit_def = ui.commandDefinitions.addButtonDefinition(
+        EDIT_CMD_ID, 'Edit Wave Bend', 'Edit an existing Wave Bend feature')
+    futil.add_handler(edit_def.commandCreated, edit_command_created)
     # Timeline identity: the custom-feature definition that puts the Wave Bend icon
     # on every cut's timeline node. (verify: CustomFeatureDefinition.create)
     global _custom_def
     try:
         _custom_def = adsk.fusion.CustomFeatureDefinition.create(
             f'{config.COMPANY_NAME}.{config.ADDIN_NAME}.waveBend', CMD_NAME, ICON_FOLDER)
+        _custom_def.editCommandId = EDIT_CMD_ID        # (verify: editCommandId)
     except Exception:
         # e.g. definition already registered from a previous load in this session
         futil.log(f'{CMD_NAME}: custom-feature definition unavailable:\n{traceback.format_exc()}')
@@ -489,6 +536,12 @@ def stop():
             wrap_def.deleteMe()
     except Exception:
         pass
+    edit_def = ui.commandDefinitions.itemById(EDIT_CMD_ID)
+    try:
+        if edit_def:
+            edit_def.deleteMe()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -510,36 +563,15 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     sel.addSelectionFilter('SketchLines')
     sel.setSelectionLimits(1, 0)                       # 1..unlimited
 
-    style_dd = inputs.addDropDownCommandInput(
-        'patternStyle', 'Pattern style', adsk.core.DropDownStyles.TextListDropDownStyle)
-    for key, label in config.PATTERN_STYLE_LABELS:
-        style_dd.listItems.add(label, key == config.DEFAULT_PATTERN_STYLE)
-
     t = _FALLBACK_T_CM
     gap = config.default_gap_cm(t, config.FAMILY_ALUMINUM)
-    inputs.addValueInput('thickness', 'Thickness', units,
-                         adsk.core.ValueInput.createByReal(t))
-    mat = inputs.addDropDownCommandInput('material', 'Material',
-                                         adsk.core.DropDownStyles.TextListDropDownStyle)
-    for name in config.MATERIAL_FAMILIES:
-        mat.listItems.add(name, name == config.FAMILY_ALUMINUM)
-    inputs.addValueInput('gap', 'Gap (cut width)', units,
-                         adsk.core.ValueInput.createByReal(gap))
-    inputs.addValueInput('tab', 'Tab (min material)', units,
-                         adsk.core.ValueInput.createByReal(config.default_tab_cm(t)))
-    inputs.addValueInput('fillet', 'Fillet radius', units,
-                         adsk.core.ValueInput.createByReal(config.default_fillet_cm(gap)))
-    inputs.addValueInput('slotLen', 'Slot length', units,
-                         adsk.core.ValueInput.createByReal(config.DEFAULT_SLOT_LEN_CM))
-    diag_in = inputs.addValueInput('diagLen', 'End length', units,
-                                   adsk.core.ValueInput.createByReal(config.DEFAULT_DIAG_LEN_CM))
-    diag_in.tooltip = ('Length of the angled end segments of each wave slot '
-                       '(the diagonal runs that sweep away from the bend line)')
-    diag_in.isVisible = True                           # wave is the default style
-    inputs.addIntegerSpinnerCommandInput('slotCount', 'Slot count', 1, 999, 1, 6)
-    status = inputs.addTextBoxCommandInput(
-        'status', 'Status', 'Select bend lines to preview the pattern.', 4, True)
-    status.isFullWidth = True
+    _param_inputs(inputs, units, {
+        'style': config.DEFAULT_PATTERN_STYLE, 't': t, 'family': config.FAMILY_ALUMINUM,
+        'gap': gap, 'tab': config.default_tab_cm(t),
+        'fil': config.default_fillet_cm(gap), 'slot': config.DEFAULT_SLOT_LEN_CM,
+        'diag': config.DEFAULT_DIAG_LEN_CM, 'count': 6,
+        'status_text': 'Select bend lines to preview the pattern.',
+    })
 
     # Adopt pre-selected bend lines (standard Fusion command behavior): anything the
     # user (or automation) selected before launching the command flows into the input.
@@ -573,6 +605,39 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     futil.add_handler(args.command.inputChanged, command_input_changed, local_handlers=local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
+
+
+def _param_inputs(inputs, units, seed):
+    """The shared parameter inputs (everything except the bend-line selection),
+    seeded with the given values. Used by both the create and the edit dialog."""
+    style_dd = inputs.addDropDownCommandInput(
+        'patternStyle', 'Pattern style', adsk.core.DropDownStyles.TextListDropDownStyle)
+    for key, label in config.PATTERN_STYLE_LABELS:
+        style_dd.listItems.add(label, key == seed['style'])
+    inputs.addValueInput('thickness', 'Thickness', units,
+                         adsk.core.ValueInput.createByReal(seed['t']))
+    mat = inputs.addDropDownCommandInput('material', 'Material',
+                                         adsk.core.DropDownStyles.TextListDropDownStyle)
+    for name in config.MATERIAL_FAMILIES:
+        mat.listItems.add(name, name == seed['family'])
+    inputs.addValueInput('gap', 'Gap (cut width)', units,
+                         adsk.core.ValueInput.createByReal(seed['gap']))
+    inputs.addValueInput('tab', 'Tab (min material)', units,
+                         adsk.core.ValueInput.createByReal(seed['tab']))
+    inputs.addValueInput('fillet', 'Fillet radius', units,
+                         adsk.core.ValueInput.createByReal(seed['fil']))
+    inputs.addValueInput('slotLen', 'Slot length', units,
+                         adsk.core.ValueInput.createByReal(seed['slot']))
+    diag_in = inputs.addValueInput('diagLen', 'End length', units,
+                                   adsk.core.ValueInput.createByReal(seed['diag']))
+    diag_in.tooltip = ('Length of the angled end segments of each wave slot '
+                       '(the diagonal runs that sweep away from the bend line)')
+    diag_in.isVisible = (seed['style'] == G.STYLE_WAVE)
+    inputs.addIntegerSpinnerCommandInput('slotCount', 'Slot count', 1, 999, 1,
+                                         int(seed.get('count', 6)))
+    status = inputs.addTextBoxCommandInput('status', 'Status',
+                                           seed.get('status_text', ''), 4, True)
+    status.isFullWidth = True
 
 
 def _reseed_from_body(inputs):
@@ -771,7 +836,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
         inputs = args.command.commandInputs
         results, warnings = _build(inputs, sketch_only=False)
         total = sum(r['pattern']['count'] for r in results)
-        wrapped = sum(1 for r in results if r.get('wrapped'))
+        wrapped = len({id(r['cut']) for r in results if r.get('wrapped')})
         _log_file('OK  WaveBend add-in: {} slots on {} line(s) ({} custom-feature node(s))'.format(
             total, len(results), wrapped))
     except Exception:
@@ -783,6 +848,149 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     global local_handlers
     local_handlers = []
     futil.log(f'{CMD_NAME} Command Destroy Event')
+
+
+# ---------------------------------------------------------------------------
+# Edit Feature (right-click / double-click on a Wave Bend timeline node)
+# ---------------------------------------------------------------------------
+
+# What the edit dialog is operating on: {'custom_token', 'payload'}.
+_edit_ctx = None
+
+
+def _find_feature_payload(design, cf_token):
+    """(attribute, payload) of the tagged cut whose wrapper is cf_token."""
+    for attr in design.findAttributes(ATTR_GROUP, ATTR_NAME):
+        try:
+            payload = json.loads(attr.value)
+            if payload.get('custom_token') == cf_token:
+                return attr, payload
+        except Exception:
+            continue
+    return None, None
+
+
+def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
+    """Fusion invokes this via editCommandId. The feature being edited arrives
+    as the active selection; its stored payload seeds the same dialog inputs
+    as the create command (minus the bend-line selection — the lines are fixed)."""
+    global _edit_ctx, _auto, _cached_line_geoms, _suppress
+    futil.log(f'{CMD_NAME} Edit Command Created Event')
+    _edit_ctx = None
+    inputs = args.command.commandInputs
+    design = adsk.fusion.Design.cast(app.activeProduct)
+
+    cf = None
+    try:
+        for i in range(ui.activeSelections.count):
+            e = ui.activeSelections.item(i).entity
+            if e.objectType == adsk.fusion.CustomFeature.classType():
+                cf = adsk.fusion.CustomFeature.cast(e)
+                break
+    except Exception:
+        pass
+    attr, payload = (None, None)
+    if cf is not None:
+        attr, payload = _find_feature_payload(design, cf.entityToken)
+    if payload is None:
+        status = inputs.addTextBoxCommandInput(
+            'status', 'Status',
+            'Wave Bend data was not found on this feature — it may predate the '
+            'add-in version that stores editable parameters. Delete and recut it.',
+            4, True)
+        status.isFullWidth = True
+        futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
+        return
+
+    p = payload.get('params', {})
+    _edit_ctx = {'custom_token': payload.get('custom_token', ''), 'payload': payload}
+    _auto = dict(payload.get('auto', _auto))
+    _cached_line_geoms = [tuple(map(tuple, lg)) for lg in _payload_lines(payload)]
+
+    _suppress = True
+    try:
+        _param_inputs(inputs, _units(), {
+            'style': p.get('style', config.DEFAULT_PATTERN_STYLE),
+            't': p.get('t', _FALLBACK_T_CM),
+            'family': p.get('family', config.FAMILY_ALUMINUM),
+            'gap': p.get('gap', 0.1), 'tab': p.get('tab', 0.1),
+            'fil': p.get('fil', 0.05), 'slot': p.get('slot', config.DEFAULT_SLOT_LEN_CM),
+            'diag': p.get('diag', config.DEFAULT_DIAG_LEN_CM), 'count': 6,
+            'status_text': f'Editing {len(_cached_line_geoms)} bend line(s). '
+                           'Changes rebuild the whole feature on OK.',
+        })
+        _refresh_count(inputs)
+    finally:
+        _suppress = False
+
+    futil.add_handler(args.command.execute, edit_command_execute, local_handlers=local_handlers)
+    futil.add_handler(args.command.inputChanged, command_input_changed, local_handlers=local_handlers)
+    futil.add_handler(args.command.validateInputs, edit_command_validate, local_handlers=local_handlers)
+    futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
+
+
+def edit_command_validate(args: adsk.core.ValidateInputsEventArgs):
+    inputs = args.inputs
+    try:
+        ok = (_edit_ctx is not None
+              and inputs.itemById('thickness').value > 0
+              and inputs.itemById('gap').value > 0
+              and inputs.itemById('tab').value > 0
+              and inputs.itemById('fillet').value > 0
+              and inputs.itemById('slotLen').value > 0
+              and inputs.itemById('diagLen').value > 0)
+    except Exception:
+        ok = False
+    args.areInputsValid = ok
+
+
+def edit_command_execute(args: adsk.core.CommandEventArgs):
+    """Rebuild the edited feature with the dialog values (same machinery as the
+    material-change auto-rebuild, with the user's values as explicit overrides)."""
+    futil.log(f'{CMD_NAME} Edit Command Execute Event')
+    global _edit_ctx
+    ctx, _edit_ctx = _edit_ctx, None
+    if ctx is None:
+        return
+    try:
+        inputs = args.command.commandInputs
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        attr, payload = _find_feature_payload(design, ctx['custom_token'])
+        if attr is None:
+            _log_file('FAIL WaveBend edit: feature payload vanished')
+            return
+        old = payload.get('params', {})
+        dd = inputs.itemById('material').selectedItem
+        new_params = {
+            't': inputs.itemById('thickness').value,
+            'gap': inputs.itemById('gap').value,
+            'tab': inputs.itemById('tab').value,
+            'fil': inputs.itemById('fillet').value,
+            'slot': inputs.itemById('slotLen').value,
+            'diag': _diag(inputs),
+            'style': _style(inputs),
+            'family': dd.name if dd else old.get('family', config.FAMILY_ALUMINUM),
+        }
+        # A field the user left untouched keeps its stored auto flag; a changed
+        # field becomes an override (the user's word survives future rebuilds).
+        stored_auto = payload.get('auto', {})
+        auto = {}
+        for key, pkey in (('thickness', 't'), ('gap', 'gap'), ('tab', 'tab'),
+                          ('fillet', 'fil')):
+            unchanged = abs(new_params[pkey] - old.get(pkey, -1.0)) < 1e-9
+            auto[key] = stored_auto.get(key, True) if unchanged else False
+        auto['material'] = (stored_auto.get('material', True)
+                            if new_params['family'] == old.get('family') else False)
+        ok = _rebuild_feature(design, attr, payload,
+                              params_override=new_params, auto_override=auto)
+        if ok:
+            _log_file(f'OK  WaveBend edit: {len(_payload_lines(payload))} line(s) rebuilt')
+        else:
+            _log_file('FAIL WaveBend edit — see Text Commands')
+    except Exception:
+        _log_file('FAIL WaveBend edit:\n' + traceback.format_exc())
+        ui.messageBox('Wave Bend edit failed — see Text Commands for details.',
+                      'Wave Bend')
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +1097,7 @@ def _find_stale_features(design):
     for attr in design.findAttributes(ATTR_GROUP, ATTR_NAME):          # (verify)
         try:
             payload = json.loads(attr.value)
-            if payload.get('version') != ATTR_VERSION:
+            if payload.get('version') not in (1, ATTR_VERSION):
                 continue
             auto = payload.get('auto', {})
             if not any(auto.get(k, True) for k in ('thickness', 'gap', 'tab', 'fillet')):
@@ -910,22 +1118,20 @@ def _find_stale_features(design):
     return stale
 
 
-def _rebuild_feature(design, attr, payload):
-    """Rebuild one tagged cut with re-derived auto values (overrides preserved).
+def _rebuild_feature(design, attr, payload, params_override=None, auto_override=None):
+    """Rebuild one tagged feature (which may carry SEVERAL bend lines) with
+    re-derived auto values — or, for the Edit Feature dialog, with the explicit
+    `params_override`/`auto_override` the user just entered.
 
     Everything that can be validated is validated BEFORE the old feature is
     deleted (the pattern solve is pure math), so an infeasible new parameter set
     leaves the existing cut untouched. Only a hard Fusion API failure after the
     delete can lose the feature — and that is reported loudly, not swallowed."""
     try:
-        line_geom = payload.get('line_geom')
-        if not line_geom:
-            # legacy payload (token-based): tokens proved unstable — resolve but verify
-            lines = design.findEntityByToken(payload.get('line_token', ''))
-            if not lines:
-                futil.log('WaveBend update: bend line no longer exists; skipping one feature')
-                return False
-            line_geom = _line_geom(lines[0])
+        lines = _payload_lines(payload)
+        if not lines:
+            futil.log('WaveBend update: payload has no bend lines; skipping one feature')
+            return False
         # Re-resolve the body NOW: earlier rebuilds in this batch may have replaced
         # timeline state, and a pre-resolved handle could be stale.
         bodies = design.findEntityByToken(payload.get('body_token', ''))
@@ -933,31 +1139,45 @@ def _rebuild_feature(design, attr, payload):
         if body is None:
             futil.log('WaveBend update: host body no longer exists; skipping one feature')
             return False
-        params = payload.get('params', {})
-        auto = payload.get('auto', {})
+        auto = dict(payload.get('auto', {}))
+        if auto_override is not None:
+            auto = dict(auto_override)
 
-        now = _snapshot_for(body)
-        t = FB.read_thickness_cm(body) if auto.get('thickness', True) else params['t']
-        # The material family follows the body ONLY when the user never overrode the
-        # dropdown; an override is the user's word and survives every rebuild.
-        stored_family = params.get('family', '')
-        if auto.get('material', True):
-            family = now['family'] or stored_family or config.FAMILY_ALUMINUM
+        if params_override is not None:
+            params = dict(params_override)
+            t, family = params['t'], params['family']
+            gap, tab, fil = params['gap'], params['tab'], params['fil']
+            style = params.get('style', config.DEFAULT_PATTERN_STYLE)
+            slot = max(params['slot'],
+                       G.min_slot_len(style, gap, fil))
+            diag = params.get('diag', config.DEFAULT_DIAG_LEN_CM)
+            now = _snapshot_for(body)
         else:
-            family = stored_family or config.FAMILY_ALUMINUM
-        style = params.get('style', config.DEFAULT_PATTERN_STYLE)
-        gap = (config.default_gap_cm(t, family, style=style)
-               if auto.get('gap', True) else params['gap'])
-        tab = (config.default_tab_cm(t) if auto.get('tab', True) else params['tab'])
-        fil = (config.default_fillet_cm(gap) if auto.get('fillet', True) else params['fil'])
-        # A gap-widening material change can push the stored slot below what the
-        # style can build (e.g. the meander) — auto-lengthen so the rebuild holds.
-        slot = max(params['slot'], G.min_slot_len(style, gap, fil))
-        diag = params.get('diag', config.DEFAULT_DIAG_LEN_CM)
+            params = payload.get('params', {})
+            now = _snapshot_for(body)
+            t = FB.read_thickness_cm(body) if auto.get('thickness', True) else params['t']
+            # The material family follows the body ONLY when the user never overrode
+            # the dropdown; an override is the user's word and survives every rebuild.
+            stored_family = params.get('family', '')
+            if auto.get('material', True):
+                family = now['family'] or stored_family or config.FAMILY_ALUMINUM
+            else:
+                family = stored_family or config.FAMILY_ALUMINUM
+            style = params.get('style', config.DEFAULT_PATTERN_STYLE)
+            gap = (config.default_gap_cm(t, family, style=style)
+                   if auto.get('gap', True) else params['gap'])
+            tab = (config.default_tab_cm(t) if auto.get('tab', True) else params['tab'])
+            fil = (config.default_fillet_cm(gap) if auto.get('fillet', True) else params['fil'])
+            # A gap-widening material change can push the stored slot below what the
+            # style can build (e.g. the meander) — auto-lengthen so the rebuild holds.
+            slot = max(params['slot'], G.min_slot_len(style, gap, fil))
+            diag = params.get('diag', config.DEFAULT_DIAG_LEN_CM)
 
-        # Validate the new pattern BEFORE touching the old feature.
-        frame = FB.frame_from_points(*line_geom)
-        pattern = _get_pattern(frame[3], gap, tab, fil, slot, style, diag)  # ValueError -> untouched
+        # Validate EVERY line's new pattern BEFORE touching the old feature.
+        patterns = []
+        for line_geom in lines:
+            frame = FB.frame_from_points(*line_geom)
+            patterns.append(_get_pattern(frame[3], gap, tab, fil, slot, style, diag))
     except ValueError as e:
         futil.log(f'WaveBend update: new parameters infeasible, feature left as-is: {e}')
         return False
@@ -986,16 +1206,19 @@ def _rebuild_feature(design, attr, payload):
                 sk.deleteMe()
             except Exception:
                 pass
-        frame = FB.frame_from_points(*line_geom)       # fresh after the delete
-        name = _feature_name(style, pattern["count"])
+        # Fresh frames after the delete, one sketch + one cut for the whole group.
+        pairs = [(patterns[i], FB.frame_from_points(*lines[i]))
+                 for i in range(len(lines))]
+        total = sum(p['count'] for p, _f in pairs)
+        name = _feature_name(style, total, len(pairs))
         comp = design.rootComponent
-        sk_new, cut_new = FB.draw_and_cut(comp, pattern, frame, t, name=name)
+        sk_new, cut_new = FB.draw_and_cut_multi(comp, pairs, t, name=name)
         cf_token = _wrap_custom_feature(comp, sk_new, cut_new, name)
         new_params = {'t': t, 'gap': gap, 'tab': tab, 'fil': fil, 'slot': slot,
                       'family': family, 'style': style, 'diag': diag}
         payload_new = {
             'version': ATTR_VERSION,
-            'line_geom': line_geom,
+            'lines': lines,
             'sketch_token': sk_new.entityToken,
             'body_token': body.entityToken,
             'custom_token': cf_token,
