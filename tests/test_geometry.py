@@ -43,23 +43,40 @@ class TestWaveCell(unittest.TestCase):
     # representative cm inputs: slot=0.65", gap=0.7*0.125", fillet=0.3*gap, diag=0.19"
     SLOT, GAP, FIL, DIAG = 1.651, 0.2222, 0.0667, 0.4826
     TH = math.radians(40.0)
-    def test_closed_loop_of_12_segments(self):
+    def test_closed_loop_of_17_segments(self):
         cell = G.build_wave_cell(self.SLOT, self.GAP, self.FIL)
-        self.assertEqual(len(cell), 12)      # 6 lines + 2 caps + 4 knee fillets
+        # 9 lines + 4 knee fillets + 4 squared-end corner fillets
+        self.assertEqual(len(cell), 17)
         pts = G.sample_profile(cell, n=8)
         self.assertAlmostEqual(pts[0].x, pts[-1].x, places=6)
         self.assertAlmostEqual(pts[0].y, pts[-1].y, places=6)
     def test_smile_dimensions_match_swept_path(self):
         cell = G.build_wave_cell(self.SLOT, self.GAP, self.FIL)
         xmin, ymin, xmax, ymax = G._bbox(G.sample_profile(cell))
-        exp_w = self.SLOT + 2 * self.DIAG * math.cos(self.TH) + self.GAP
-        exp_h = self.DIAG * math.sin(self.TH) + self.GAP
+        # Squared ends: the end-face corners sit gap/2 past the path endpoint
+        # along the diagonal AND gap/2 across it, so the extremes carry a
+        # (sin th + cos th) factor; the corner fillet then shaves the sharp
+        # corner's reach by r*(sin th + cos th - 1).
+        sc = math.sin(self.TH) + math.cos(self.TH)
+        reach = sc * self.GAP / 2.0 - self.FIL * (sc - 1.0)
+        exp_w = self.SLOT + 2 * self.DIAG * math.cos(self.TH) + 2 * reach
+        exp_h = self.DIAG * math.sin(self.TH) + reach + self.GAP / 2.0
         self.assertAlmostEqual(xmax - xmin, exp_w, delta=0.02)
         self.assertAlmostEqual(ymax - ymin, exp_h, delta=0.02)
         # the horizontal run sits ON the bend line: lower edge exactly at -gap/2
         self.assertAlmostEqual(ymin, -self.GAP / 2, places=6)
         # smile: swept ends rise well above the horizontal
         self.assertGreater(ymax, self.DIAG * math.sin(self.TH) * 0.9)
+    def test_end_corner_fillets_track_fillet_input(self):
+        # Arcs at exactly fillet_r: 2 inner knees + the 4 squared-end corners.
+        for fil in (0.04, 0.0667, 0.09):
+            cell = G.build_wave_cell(self.SLOT, self.GAP, fil)
+            fillet_arcs = [s for s in cell if s[0] == "arc"
+                           and abs(s[2] - fil) < 1e-9]
+            self.assertEqual(len(fillet_arcs), 6, f"fillet={fil}")
+    def test_fillet_at_or_above_half_gap_raises(self):
+        with self.assertRaises(ValueError):
+            G.build_wave_cell(self.SLOT, self.GAP, self.GAP / 2.0)
     def test_frown_is_exact_mirror_of_smile(self):
         s = G._bbox(G.sample_profile(G.build_wave_cell(self.SLOT, self.GAP, self.FIL, orient=+1)))
         f = G._bbox(G.sample_profile(G.build_wave_cell(self.SLOT, self.GAP, self.FIL, orient=-1)))

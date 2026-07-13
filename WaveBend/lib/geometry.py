@@ -126,9 +126,11 @@ def build_wave_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, diag_len=0.4826
     """One wave slot: a constant-width SMILE (orient=+1) or FROWN (orient=-1).
 
     The cut is a swept path -- diagonal end, horizontal (length slot_len), diagonal
-    end, both ends sweeping to the SAME side -- of width `gap`, with semicircular
-    caps (r = gap/2) at the free ends, inner knee fillets of radius `fillet_r`, and
-    outer knee fillets of radius `fillet_r + gap` (constant width preserved).
+    end, both ends sweeping to the SAME side -- of width `gap`, with SQUARED ends
+    whose two corners carry fillets of radius `fillet_r` (the same dialog Fillet
+    that rounds the knees: inner knees at `fillet_r`, outer at `fillet_r + gap`).
+    The squared end face sits gap/2 past the path endpoint, preserving the pill
+    cap's overall extent, so fillet_r must stay below gap/2 for the corners to fit.
 
     Matches the SendCutSend reference DXF: horizontal ~0.65 in, diagonals ~0.19 in
     at ~40 deg; only the gap scales with material thickness. The horizontal edge of
@@ -139,6 +141,9 @@ def build_wave_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, diag_len=0.4826
         raise ValueError("gap, slot_len and diag_len must all be positive")
     if fillet_r <= 0:
         raise ValueError("fillet_r must be > 0 (sharp internal corners crack when bent)")
+    if fillet_r > gap / 2.0 - 1e-9:
+        raise ValueError("fillet_r too large for the squared slot ends "
+                         "(needs < gap/2 so both end corners fit)")
     th = math.radians(end_angle_deg)
     if not (math.radians(5.0) < th < math.radians(85.0)):
         raise ValueError("end_angle_deg out of range (5..85)")
@@ -173,27 +178,35 @@ def build_wave_cell(slot_len, gap, fillet_r, end_angle_deg=40.0, diag_len=0.4826
             fCl[5] > _d(Cl, Da) - 1e-9 or fCu[5] > _d(Cu, Du) - 1e-9):
         raise ValueError("fillet_r or gap too large for diag_len (no room on the diagonal)")
 
-    def cap(center, from_pt):
-        # 180-degree end cap, CCW from from_pt; midpoint bulges away from the slot.
-        a0 = math.atan2(from_pt.y - center.y, from_pt.x - center.x)
-        a1 = a0 + math.pi
-        to_pt = Pt(center.x + g2 * math.cos(a1), center.y + g2 * math.sin(a1))
-        return ("arc", center, g2, a0, a1, from_pt, to_pt), to_pt
+    # Squared ends: the end face sits gap/2 beyond the path endpoint, its two
+    # corners filleted with the SAME fillet_r as the knees. Right end corners
+    # extend along +d3, left end corners along -d1 (outward at each end).
+    CLr = Pt(Da.x + d3.x * g2, Da.y + d3.y * g2)   # right end, lower corner
+    CUr = Pt(Du.x + d3.x * g2, Du.y + d3.y * g2)   # right end, upper corner
+    CUl = Pt(Au.x - d1.x * g2, Au.y - d1.y * g2)   # left end, upper corner
+    CLl = Pt(La.x - d1.x * g2, La.y - d1.y * g2)   # left end, lower corner
+    flr = fillet_corner(Da, CLr, CUr, fillet_r)    # right lower corner
+    fur = fillet_corner(CLr, CUr, Du, fillet_r)    # right upper corner
+    ful = fillet_corner(Au, CUl, CLl, fillet_r)    # left upper corner
+    fll = fillet_corner(CUl, CLl, La, fillet_r)    # left lower corner
 
     segs = [("line", La, fBl[0]),
             ("arc", fBl[2], r_out, fBl[3], fBl[4], fBl[0], fBl[1]),
             ("line", fBl[1], fCl[0]),
             ("arc", fCl[2], r_out, fCl[3], fCl[4], fCl[0], fCl[1]),
-            ("line", fCl[1], Da)]
-    cap_r, du = cap(D, Da)
-    segs.append(cap_r)
-    segs += [("line", du, fCu[0]),
-             ("arc", fCu[2], r_in, fCu[3], fCu[4], fCu[0], fCu[1]),
-             ("line", fCu[1], fBu[0]),
-             ("arc", fBu[2], r_in, fBu[3], fBu[4], fBu[0], fBu[1]),
-             ("line", fBu[1], Au)]
-    cap_l, _ = cap(A, Au)
-    segs.append(cap_l)
+            ("line", fCl[1], flr[0]),
+            ("arc", flr[2], fillet_r, flr[3], flr[4], flr[0], flr[1]),
+            ("line", flr[1], fur[0]),
+            ("arc", fur[2], fillet_r, fur[3], fur[4], fur[0], fur[1]),
+            ("line", fur[1], fCu[0]),
+            ("arc", fCu[2], r_in, fCu[3], fCu[4], fCu[0], fCu[1]),
+            ("line", fCu[1], fBu[0]),
+            ("arc", fBu[2], r_in, fBu[3], fBu[4], fBu[0], fBu[1]),
+            ("line", fBu[1], ful[0]),
+            ("arc", ful[2], fillet_r, ful[3], ful[4], ful[0], ful[1]),
+            ("line", ful[1], fll[0]),
+            ("arc", fll[2], fillet_r, fll[3], fll[4], fll[0], fll[1]),
+            ("line", fll[1], La)]
     # Orient (mirror v for a frown) and translate to (cx, cy).
     s = 1.0 if orient >= 0 else -1.0
     out = []
